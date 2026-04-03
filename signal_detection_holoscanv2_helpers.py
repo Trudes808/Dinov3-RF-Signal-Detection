@@ -1103,3 +1103,50 @@ def plot_merged_detection(pipeline_result: dict[str, Any], figsize: tuple[int, i
         ax.set_xlabel("Time bin")
         ax.set_ylabel("Frequency row")
     return fig, axes
+
+
+def plot_merged_debug(pipeline_result: dict[str, Any], figsize: tuple[int, int] = (20, 12)):
+    corrected_sxx_db = pipeline_result["corrected_sxx_db"]
+    merged_base_score = np.asarray(pipeline_result.get("merged_base_score", np.zeros_like(corrected_sxx_db)), dtype=np.float32)
+    merged_companion = np.asarray(pipeline_result.get("merged_companion", np.zeros_like(corrected_sxx_db)), dtype=np.float32)
+    merged_support = np.asarray(pipeline_result.get("merged_support", np.zeros_like(corrected_sxx_db, dtype=bool)), dtype=bool)
+    merged_score = np.asarray(pipeline_result["merged_score"], dtype=np.float32)
+    merged_mask = np.asarray(pipeline_result["merged_mask"], dtype=bool)
+    merged_threshold = float(pipeline_result.get("merged_threshold", 0.0))
+    valid_row_mask = np.asarray(pipeline_result.get("valid_row_mask", np.ones(corrected_sxx_db.shape[0], dtype=bool)), dtype=bool)
+
+    vmin, vmax = _display_db_window(corrected_sxx_db)
+    fig, axes = plt.subplots(2, 2, figsize=figsize, constrained_layout=True)
+
+    axes[0][0].imshow(merged_base_score, aspect="auto", origin="lower", cmap="magma", vmin=0.0, vmax=1.0)
+    axes[0][0].set_title("Merged base score")
+
+    axes[0][1].imshow(merged_companion, aspect="auto", origin="lower", cmap="cividis", vmin=0.0, vmax=1.0)
+    axes[0][1].set_title("Merged companion gate")
+
+    axes[1][0].imshow(corrected_sxx_db, aspect="auto", origin="lower", cmap="gray", vmin=vmin, vmax=vmax)
+    axes[1][0].imshow(np.where(merged_support, 1.0, np.nan), aspect="auto", origin="lower", cmap="winter", alpha=0.50)
+    axes[1][0].set_title("Merged support region")
+
+    axes[1][1].imshow(corrected_sxx_db, aspect="auto", origin="lower", cmap="gray", vmin=vmin, vmax=vmax)
+    axes[1][1].imshow(np.where(merged_score >= merged_threshold, 1.0, np.nan), aspect="auto", origin="lower", cmap="plasma", alpha=0.22)
+    axes[1][1].imshow(np.where(merged_mask, 1.0, np.nan), aspect="auto", origin="lower", cmap="autumn", alpha=0.55)
+    axes[1][1].set_title(f"Final overlay | threshold={merged_threshold:.3f}")
+
+    ignored_rows = np.flatnonzero(~valid_row_mask)
+    if ignored_rows.size > 0:
+        low_block = ignored_rows[ignored_rows < (corrected_sxx_db.shape[0] // 2)]
+        high_block = ignored_rows[ignored_rows >= (corrected_sxx_db.shape[0] // 2)]
+        for row in axes:
+            for ax in row:
+                if low_block.size > 0:
+                    ax.axhspan(low_block[0], low_block[-1], color="black", alpha=0.12)
+                if high_block.size > 0:
+                    ax.axhspan(high_block[0], high_block[-1], color="black", alpha=0.12)
+
+    for row in axes:
+        for ax in row:
+            ax.set_xlabel("Time bin")
+            ax.set_ylabel("Frequency row")
+
+    return fig, axes
