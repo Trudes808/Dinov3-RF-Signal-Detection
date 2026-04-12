@@ -26,7 +26,10 @@ IMAGENET_STD = (0.229, 0.224, 0.225)
 class WidebandChunkConfig:
     chunk_bandwidth_hz: float = 50e6
     chunk_overlap_hz: float = 10e6
-    ignore_sideband_hz: float = 0.0
+    uncalibrated_chunk_fraction: float = 0.40
+    uncalibrated_overlap_fraction: float = 0.20
+    ignore_sideband_percent: float = 0.10
+    ignore_sideband_hz: float | None = None
     dino_db_min: float = -110.0
     dino_db_max: float = -40.0
     dino_group_k: int = 8
@@ -80,9 +83,37 @@ def load_usrp_spectrogram_summary(summary_path: str | Path | None) -> dict[str, 
         return json.load(f)
 
 
+def read_pgm_raw(path: str | Path) -> np.ndarray:
+    path = Path(path)
+    with path.open("rb") as f:
+        magic = f.readline().strip()
+        if magic != b"P5":
+            raise ValueError(f"{path.name}: unsupported PGM magic {magic!r}")
+
+        header_tokens: list[bytes] = []
+        while len(header_tokens) < 3:
+            line = f.readline()
+            if not line:
+                raise ValueError(f"{path.name}: truncated PGM header")
+            line = line.strip()
+            if not line or line.startswith(b"#"):
+                continue
+            header_tokens.extend(line.split())
+
+        cols, rows, maxval = map(int, header_tokens[:3])
+        if maxval > 255:
+            raise ValueError(f"{path.name}: only 8-bit PGM supported (maxval={maxval})")
+
+        data = f.read(rows * cols)
+        if len(data) != rows * cols:
+            raise ValueError(f"{path.name}: unexpected payload length {len(data)}")
+
+    arr = np.frombuffer(data, dtype=np.uint8).reshape(rows, cols).astype(np.float32)
+    return np.ascontiguousarray(arr)
+
+
 def read_pgm(path: str | Path) -> np.ndarray:
-    arr = np.asarray(Image.open(path), dtype=np.float32)
-    return np.ascontiguousarray(arr.T)
+    return read_pgm_raw(path)
 
 
 def read_sigmf_meta(meta_path: str | Path):
@@ -209,8 +240,9 @@ def load_input_record(
     if resolved_kind == "pgm":
         summary = load_usrp_spectrogram_summary(usrp_summary_path)
         channel = infer_channel_from_filename(input_path)
-        sxx_db = read_pgm(input_path)
-        time_axis_s = np.arange(sxx_db.shape[1], dtype=np.float32)
+        pgm_img = read_pgm_raw(input_path)
+        sxx_db = np.ascontiguousarray(pgm_img.T)
+        time_axis_s = np.arange(pgm_img.shape[0], dtype=np.float32)
         center_frequency_hz = None
         sample_rate_hz = None
         if summary is not None and channel is not None:
@@ -228,6 +260,7 @@ def load_input_record(
             "input_kind": "pgm",
             "input_path": str(input_path),
             "sxx_db": sxx_db.astype(np.float32),
+            "display_sxx_db": pgm_img.astype(np.float32),
             "freq_axis_hz": freq_axis_hz.astype(np.float32),
             "time_axis_s": time_axis_s,
             "center_frequency_hz": center_frequency_hz,
@@ -293,26 +326,39 @@ def apply_global_frontend_correction(
     }
 
 
-def compute_ignore_sideband_rows(freq_axis_hz: np.ndarray, ignore_sideband_hz: float, min_keep_rows: int = 16) -> dict[str, float | int | np.ndarray]:
+def compute_ignore_sideband_rows(
+    freq_axis_hz: np.ndarray,
+    ignore_sideband_percent: float = 0.10,
+    min_keep_rows: int = 16,
+    ignore_sideband_hz: float | None = None,
+) -> dict[str, float | int | np.ndarray]:
     freq_axis_hz = np.asarray(freq_axis_hz, dtype=np.float32).reshape(-1)
     num_rows = int(freq_axis_hz.size)
+    clipped_percent = float(np.clip(ignore_sideband_percent, 0.0, 0.49))
     info: dict[str, float | int | np.ndarray] = {
-        "requested_hz": float(max(0.0, ignore_sideband_hz)),
+        "requested_percent": clipped_percent,
+        "applied_percent": 0.0,
+        "requested_hz": float(max(0.0, ignore_sideband_hz or 0.0)),
         "requested_bins": 0,
         "applied_hz": 0.0,
         "applied_bins": 0,
         "bin_hz": 0.0,
         "valid_row_mask": np.ones(num_rows, dtype=bool),
     }
-    if num_rows < 2 or ignore_sideband_hz <= 0.0:
+    if num_rows < 2:
         return info
 
     bin_hz = float(np.median(np.abs(np.diff(freq_axis_hz))))
     if not np.isfinite(bin_hz) or bin_hz <= 0.0:
         return info
 
-    requested_bins = int(np.ceil(float(ignore_sideband_hz) / bin_hz))
     max_bins = max(0, (num_rows - int(max(1, min_keep_rows))) // 2)
+    if clipped_percent > 0.0:
+        requested_bins = int(np.ceil(num_rows * clipped_percent))
+        requested_hz = float(requested_bins * bin_hz)
+    else:
+        requested_hz = float(max(0.0, ignore_sideband_hz or 0.0))
+        requested_bins = int(np.ceil(requested_hz / bin_hz)) if requested_hz > 0.0 else 0
     applied_bins = int(np.clip(requested_bins, 0, max_bins))
     valid_row_mask = np.ones(num_rows, dtype=bool)
     if applied_bins > 0:
@@ -321,6 +367,9 @@ def compute_ignore_sideband_rows(freq_axis_hz: np.ndarray, ignore_sideband_hz: f
 
     info.update(
         {
+            "requested_percent": clipped_percent,
+            "applied_percent": float(applied_bins / max(num_rows, 1)),
+            "requested_hz": requested_hz,
             "requested_bins": int(requested_bins),
             "applied_hz": float(applied_bins * bin_hz),
             "applied_bins": int(applied_bins),
@@ -331,7 +380,15 @@ def compute_ignore_sideband_rows(freq_axis_hz: np.ndarray, ignore_sideband_hz: f
     return info
 
 
-def build_frequency_chunks(freq_axis_hz: np.ndarray, chunk_bandwidth_hz: float, chunk_overlap_hz: float, min_rows: int = 16, valid_row_mask: np.ndarray | None = None) -> list[dict[str, Any]]:
+def build_frequency_chunks(
+    freq_axis_hz: np.ndarray,
+    chunk_bandwidth_hz: float,
+    chunk_overlap_hz: float,
+    min_rows: int = 16,
+    valid_row_mask: np.ndarray | None = None,
+    uncalibrated_chunk_fraction: float = 0.40,
+    uncalibrated_overlap_fraction: float = 0.20,
+) -> list[dict[str, Any]]:
     freq_axis_hz = np.asarray(freq_axis_hz, dtype=np.float32).reshape(-1)
     if freq_axis_hz.size == 0:
         return []
@@ -352,6 +409,46 @@ def build_frequency_chunks(freq_axis_hz: np.ndarray, chunk_bandwidth_hz: float, 
     step_hz = chunk_bandwidth_hz - chunk_overlap_hz
     if step_hz <= 0:
         raise ValueError("chunk_bandwidth_hz must be larger than chunk_overlap_hz")
+
+    freq_span = float(freq_max - freq_min)
+    if freq_span <= 0.0 or chunk_bandwidth_hz >= freq_span:
+        valid_count = int(valid_idx.size)
+        chunk_fraction = float(np.clip(uncalibrated_chunk_fraction, 0.10, 1.0))
+        overlap_fraction = float(np.clip(uncalibrated_overlap_fraction, 0.0, 0.95))
+        chunk_rows = int(np.clip(round(valid_count * chunk_fraction), min_rows, valid_count))
+        if chunk_rows >= valid_count:
+            return [
+                {
+                    "chunk_index": 0,
+                    "row_start": int(valid_idx[0]),
+                    "row_stop": int(valid_idx[-1]) + 1,
+                    "freq_start_hz": float(freq_axis_hz[valid_idx[0]]),
+                    "freq_stop_hz": float(freq_axis_hz[valid_idx[-1]]),
+                }
+            ]
+        overlap_rows = int(np.clip(round(chunk_rows * overlap_fraction), 0, chunk_rows - 1))
+        step_rows = max(1, chunk_rows - overlap_rows)
+        chunks: list[dict[str, Any]] = []
+        chunk_index = 0
+        start_pos = 0
+        while start_pos < valid_count:
+            stop_pos = min(start_pos + chunk_rows, valid_count)
+            in_chunk = valid_idx[start_pos:stop_pos]
+            if in_chunk.size >= int(min_rows):
+                chunks.append(
+                    {
+                        "chunk_index": chunk_index,
+                        "row_start": int(in_chunk[0]),
+                        "row_stop": int(in_chunk[-1]) + 1,
+                        "freq_start_hz": float(freq_axis_hz[in_chunk[0]]),
+                        "freq_stop_hz": float(freq_axis_hz[in_chunk[-1]]),
+                    }
+                )
+                chunk_index += 1
+            if stop_pos >= valid_count:
+                break
+            start_pos += step_rows
+        return chunks
 
     chunks: list[dict[str, Any]] = []
     chunk_start_hz = freq_min
@@ -798,9 +895,23 @@ def burst_companion_gate(
     }
 
 
-def power_prior_patch_map(sxx_db_local: np.ndarray, patch_h: int, patch_w: int) -> np.ndarray:
+def power_prior_patch_map(
+    sxx_db_local: np.ndarray,
+    patch_h: int,
+    patch_w: int,
+    valid_row_mask: np.ndarray | None = None,
+) -> np.ndarray:
     p_lin = np.power(10.0, np.asarray(sxx_db_local, dtype=np.float32) / 10.0)
-    p_floor = max(float(np.percentile(p_lin, 30.0)), 1e-20)
+    if valid_row_mask is None:
+        valid_values = p_lin.reshape(-1)
+    else:
+        valid_row_mask = np.asarray(valid_row_mask, dtype=bool).reshape(-1)
+        if valid_row_mask.shape[0] != p_lin.shape[0]:
+            raise ValueError("valid_row_mask length must match the number of spectrogram rows")
+        valid_values = p_lin[valid_row_mask, :].reshape(-1)
+        if valid_values.size == 0:
+            valid_values = p_lin.reshape(-1)
+    p_floor = max(float(np.percentile(valid_values, 30.0)), 1e-20)
     rel_db = 10.0 * np.log10(np.maximum(p_lin, 1e-20) / p_floor)
     rel_db = np.clip(rel_db, -5.0, 25.0)
     return patch_mean_map(rel_db, patch_h, patch_w)
@@ -823,6 +934,7 @@ def run_chunk_detector(
     patch_size: int,
     device: str,
     cfg: WidebandChunkConfig,
+    valid_row_mask: np.ndarray | None = None,
 ) -> dict[str, Any]:
     t0 = time.perf_counter()
     dino_group = dino_grouping_from_spectrogram(
@@ -846,7 +958,11 @@ def run_chunk_detector(
     )
     t2 = time.perf_counter()
     patch_h, patch_w = tuple(dino_gated["shape"])
-    power_patch = _normalize_map01_local(power_prior_patch_map(sxx_db_chunk, patch_h, patch_w), 5.0, 95.0)
+    power_patch = _normalize_map01_local(
+        power_prior_patch_map(sxx_db_chunk, patch_h, patch_w, valid_row_mask=valid_row_mask),
+        5.0,
+        95.0,
+    )
     burst_gate = burst_companion_gate(
         sxx_db_chunk,
         coherence_gate_px=dino_gated["coherence_gate_px"],
@@ -962,8 +1078,9 @@ def run_chunked_pipeline(
     t0 = time.perf_counter()
     ignore_info = compute_ignore_sideband_rows(
         input_record["freq_axis_hz"],
-        ignore_sideband_hz=cfg.ignore_sideband_hz,
+        ignore_sideband_percent=cfg.ignore_sideband_percent,
         min_keep_rows=max(int(patch_size), 16),
+        ignore_sideband_hz=cfg.ignore_sideband_hz,
     )
     valid_row_mask = np.asarray(ignore_info["valid_row_mask"], dtype=bool)
     correction = apply_global_frontend_correction(
@@ -981,11 +1098,21 @@ def run_chunked_pipeline(
         chunk_overlap_hz=cfg.chunk_overlap_hz,
         min_rows=max(int(patch_size), 16),
         valid_row_mask=valid_row_mask,
+        uncalibrated_chunk_fraction=cfg.uncalibrated_chunk_fraction,
+        uncalibrated_overlap_fraction=cfg.uncalibrated_overlap_fraction,
     )
     chunk_results: list[dict[str, Any]] = []
     for chunk in chunk_plan:
         row_slice = slice(chunk["row_start"], chunk["row_stop"])
-        detection = run_chunk_detector(corrected_sxx_db[row_slice, :], model, patch_size, device, cfg)
+        chunk_valid_row_mask = valid_row_mask[row_slice]
+        detection = run_chunk_detector(
+            corrected_sxx_db[row_slice, :],
+            model,
+            patch_size,
+            device,
+            cfg,
+            valid_row_mask=chunk_valid_row_mask,
+        )
         chunk_results.append({**chunk, **detection, "valid_row_mask": valid_row_mask})
     merged = merge_chunk_results(
         corrected_sxx_db.shape,
@@ -1019,31 +1146,44 @@ def plot_frontend_overview(pipeline_result: dict[str, Any], figsize: tuple[int, 
     ignore_info = pipeline_result.get("ignore_sideband", {})
     valid_row_mask = np.asarray(ignore_info.get("valid_row_mask", np.ones(corrected_sxx_db.shape[0], dtype=bool)), dtype=bool)
     freq_axis_hz = np.asarray(record["freq_axis_hz"], dtype=np.float32)
+    display_raw = np.asarray(record.get("display_sxx_db", record["sxx_db"]), dtype=np.float32)
+    display_transposed = record.get("input_kind") == "pgm"
+    display_corrected = corrected_sxx_db.T if display_transposed else corrected_sxx_db
     raw_vmin, raw_vmax = _display_db_window(record["sxx_db"])
     corrected_vmin, corrected_vmax = _display_db_window(corrected_sxx_db)
     fig, axes = plt.subplots(3, 1, figsize=figsize, constrained_layout=True)
-    axes[0].imshow(record["sxx_db"], aspect="auto", origin="lower", cmap="viridis", vmin=raw_vmin, vmax=raw_vmax)
+    axes[0].imshow(display_raw, aspect="auto", origin="lower", cmap="viridis", vmin=raw_vmin, vmax=raw_vmax)
     axes[0].set_title("Wideband input spectrogram")
-    axes[0].set_ylabel("Frequency row")
-    axes[1].imshow(corrected_sxx_db, aspect="auto", origin="lower", cmap="viridis", vmin=corrected_vmin, vmax=corrected_vmax)
+    axes[0].set_ylabel("Time bin")
+    axes[1].imshow(display_corrected, aspect="auto", origin="lower", cmap="viridis", vmin=corrected_vmin, vmax=corrected_vmax)
     axes[1].set_title("Globally corrected spectrogram")
-    axes[1].set_ylabel("Frequency row")
+    axes[1].set_ylabel("Time bin")
     axes[2].plot(frontend["row_floor_db"], freq_axis_hz, label="Row floor")
     axes[2].plot(frontend["response_db"], freq_axis_hz, label="Smoothed response")
     axes[2].axvline(frontend["reference_db"], color="tab:green", linestyle="--", label="Reference")
     for chunk in pipeline_result["chunk_plan"]:
-        axes[1].axhline(chunk["row_start"], color="white", alpha=0.15, linewidth=0.8)
-        axes[1].axhline(chunk["row_stop"] - 1, color="white", alpha=0.15, linewidth=0.8)
+        if display_transposed:
+            axes[1].axvline(chunk["row_start"], color="white", alpha=0.15, linewidth=0.8)
+            axes[1].axvline(chunk["row_stop"] - 1, color="white", alpha=0.15, linewidth=0.8)
+        else:
+            axes[1].axhline(chunk["row_start"], color="white", alpha=0.15, linewidth=0.8)
+            axes[1].axhline(chunk["row_stop"] - 1, color="white", alpha=0.15, linewidth=0.8)
     ignored_rows = np.flatnonzero(~valid_row_mask)
     if ignored_rows.size > 0:
         low_block = ignored_rows[ignored_rows < (corrected_sxx_db.shape[0] // 2)]
         high_block = ignored_rows[ignored_rows >= (corrected_sxx_db.shape[0] // 2)]
         if low_block.size > 0:
             for ax in axes[:2]:
-                ax.axhspan(low_block[0], low_block[-1], color="black", alpha=0.18)
+                if display_transposed:
+                    ax.axvspan(low_block[0], low_block[-1], color="black", alpha=0.18)
+                else:
+                    ax.axhspan(low_block[0], low_block[-1], color="black", alpha=0.18)
         if high_block.size > 0:
             for ax in axes[:2]:
-                ax.axhspan(high_block[0], high_block[-1], color="black", alpha=0.18)
+                if display_transposed:
+                    ax.axvspan(high_block[0], high_block[-1], color="black", alpha=0.18)
+                else:
+                    ax.axhspan(high_block[0], high_block[-1], color="black", alpha=0.18)
     axes[2].set_title("Global frontend correction profile")
     axes[2].set_xlabel("Level (dB)")
     axes[2].set_ylabel("Frequency (Hz)")
@@ -1053,19 +1193,22 @@ def plot_frontend_overview(pipeline_result: dict[str, Any], figsize: tuple[int, 
 
 def plot_chunk_examples(pipeline_result: dict[str, Any], max_chunks: int = 4, figsize: tuple[int, int] = (22, 5)):
     chunk_results = pipeline_result["chunk_results"][: max(1, int(max_chunks))]
+    input_kind = pipeline_result["input_record"].get("input_kind")
     fig, axes = plt.subplots(len(chunk_results), 4, figsize=(figsize[0], figsize[1] * len(chunk_results)), constrained_layout=True)
     if len(chunk_results) == 1:
         axes = np.expand_dims(axes, axis=0)
     for row_idx, chunk in enumerate(chunk_results):
         tile = pipeline_result["corrected_sxx_db"][chunk["row_start"]:chunk["row_stop"], :]
+        display_tile = tile.T if input_kind == "pgm" else tile
+        display_mask = chunk["mask_px"].T if input_kind == "pgm" else chunk["mask_px"]
         dino = chunk["dino_gated"]
-        axes[row_idx][0].imshow(tile, aspect="auto", origin="lower", cmap="viridis")
+        axes[row_idx][0].imshow(display_tile, aspect="auto", origin="lower", cmap="viridis")
         axes[row_idx][0].set_title(f"Chunk {chunk['chunk_index']} corrected tile")
         axes[row_idx][1].imshow(dino["input_img"])
         axes[row_idx][1].set_title("DINO input")
         axes[row_idx][2].imshow(chunk["strict_patch"], cmap="magma", vmin=0.0, vmax=1.0, interpolation="nearest")
         axes[row_idx][2].set_title("Chunk strict patch score")
-        axes[row_idx][3].imshow(chunk["mask_px"], cmap="gray", vmin=0.0, vmax=1.0)
+        axes[row_idx][3].imshow(display_mask, cmap="gray", vmin=0.0, vmax=1.0)
         axes[row_idx][3].set_title("Chunk pixel mask")
         for ax in axes[row_idx]:
             ax.set_xticks([])
@@ -1079,15 +1222,20 @@ def plot_merged_detection(pipeline_result: dict[str, Any], figsize: tuple[int, i
     merged_mask = pipeline_result["merged_mask"]
     merged_support = np.asarray(pipeline_result.get("merged_support", np.ones_like(merged_mask, dtype=bool)), dtype=bool)
     valid_row_mask = np.asarray(pipeline_result.get("valid_row_mask", np.ones(corrected_sxx_db.shape[0], dtype=bool)), dtype=bool)
+    display_transposed = pipeline_result["input_record"].get("input_kind") == "pgm"
+    display_corrected = corrected_sxx_db.T if display_transposed else corrected_sxx_db
+    display_score = merged_score.T if display_transposed else merged_score
+    display_mask = merged_mask.T if display_transposed else merged_mask
+    display_support = merged_support.T if display_transposed else merged_support
     vmin, vmax = _display_db_window(corrected_sxx_db)
     fig, axes = plt.subplots(1, 3, figsize=figsize, constrained_layout=True)
-    axes[0].imshow(corrected_sxx_db, aspect="auto", origin="lower", cmap="viridis", vmin=vmin, vmax=vmax)
+    axes[0].imshow(display_corrected, aspect="auto", origin="lower", cmap="viridis", vmin=vmin, vmax=vmax)
     axes[0].set_title("Corrected wideband spectrogram")
-    axes[1].imshow(merged_score, aspect="auto", origin="lower", cmap="magma", vmin=0.0, vmax=1.0)
-    axes[1].imshow(np.where(merged_support, 1.0, np.nan), aspect="auto", origin="lower", cmap="winter", alpha=0.18)
+    axes[1].imshow(display_score, aspect="auto", origin="lower", cmap="magma", vmin=0.0, vmax=1.0)
+    axes[1].imshow(np.where(display_support, 1.0, np.nan), aspect="auto", origin="lower", cmap="winter", alpha=0.18)
     axes[1].set_title("Merged strict score + support")
-    axes[2].imshow(corrected_sxx_db, aspect="auto", origin="lower", cmap="gray", vmin=vmin, vmax=vmax)
-    axes[2].imshow(np.where(merged_mask, 1.0, np.nan), aspect="auto", origin="lower", cmap="autumn", alpha=0.55)
+    axes[2].imshow(display_corrected, aspect="auto", origin="lower", cmap="gray", vmin=vmin, vmax=vmax)
+    axes[2].imshow(np.where(display_mask, 1.0, np.nan), aspect="auto", origin="lower", cmap="autumn", alpha=0.55)
     axes[2].set_title("Merged detection overlay")
     ignored_rows = np.flatnonzero(~valid_row_mask)
     if ignored_rows.size > 0:
@@ -1095,13 +1243,19 @@ def plot_merged_detection(pipeline_result: dict[str, Any], figsize: tuple[int, i
         high_block = ignored_rows[ignored_rows >= (corrected_sxx_db.shape[0] // 2)]
         if low_block.size > 0:
             for ax in axes:
-                ax.axhspan(low_block[0], low_block[-1], color="black", alpha=0.12)
+                if display_transposed:
+                    ax.axvspan(low_block[0], low_block[-1], color="black", alpha=0.12)
+                else:
+                    ax.axhspan(low_block[0], low_block[-1], color="black", alpha=0.12)
         if high_block.size > 0:
             for ax in axes:
-                ax.axhspan(high_block[0], high_block[-1], color="black", alpha=0.12)
+                if display_transposed:
+                    ax.axvspan(high_block[0], high_block[-1], color="black", alpha=0.12)
+                else:
+                    ax.axhspan(high_block[0], high_block[-1], color="black", alpha=0.12)
     for ax in axes:
-        ax.set_xlabel("Time bin")
-        ax.set_ylabel("Frequency row")
+        ax.set_xlabel("Frequency bin")
+        ax.set_ylabel("Time bin")
     return fig, axes
 
 
@@ -1114,23 +1268,30 @@ def plot_merged_debug(pipeline_result: dict[str, Any], figsize: tuple[int, int] 
     merged_mask = np.asarray(pipeline_result["merged_mask"], dtype=bool)
     merged_threshold = float(pipeline_result.get("merged_threshold", 0.0))
     valid_row_mask = np.asarray(pipeline_result.get("valid_row_mask", np.ones(corrected_sxx_db.shape[0], dtype=bool)), dtype=bool)
+    display_transposed = pipeline_result["input_record"].get("input_kind") == "pgm"
+    display_corrected = corrected_sxx_db.T if display_transposed else corrected_sxx_db
+    display_base_score = merged_base_score.T if display_transposed else merged_base_score
+    display_companion = merged_companion.T if display_transposed else merged_companion
+    display_support = merged_support.T if display_transposed else merged_support
+    display_score = merged_score.T if display_transposed else merged_score
+    display_mask = merged_mask.T if display_transposed else merged_mask
 
     vmin, vmax = _display_db_window(corrected_sxx_db)
     fig, axes = plt.subplots(2, 2, figsize=figsize, constrained_layout=True)
 
-    axes[0][0].imshow(merged_base_score, aspect="auto", origin="lower", cmap="magma", vmin=0.0, vmax=1.0)
+    axes[0][0].imshow(display_base_score, aspect="auto", origin="lower", cmap="magma", vmin=0.0, vmax=1.0)
     axes[0][0].set_title("Merged base score")
 
-    axes[0][1].imshow(merged_companion, aspect="auto", origin="lower", cmap="cividis", vmin=0.0, vmax=1.0)
+    axes[0][1].imshow(display_companion, aspect="auto", origin="lower", cmap="cividis", vmin=0.0, vmax=1.0)
     axes[0][1].set_title("Merged companion gate")
 
-    axes[1][0].imshow(corrected_sxx_db, aspect="auto", origin="lower", cmap="gray", vmin=vmin, vmax=vmax)
-    axes[1][0].imshow(np.where(merged_support, 1.0, np.nan), aspect="auto", origin="lower", cmap="winter", alpha=0.50)
+    axes[1][0].imshow(display_corrected, aspect="auto", origin="lower", cmap="gray", vmin=vmin, vmax=vmax)
+    axes[1][0].imshow(np.where(display_support, 1.0, np.nan), aspect="auto", origin="lower", cmap="winter", alpha=0.50)
     axes[1][0].set_title("Merged support region")
 
-    axes[1][1].imshow(corrected_sxx_db, aspect="auto", origin="lower", cmap="gray", vmin=vmin, vmax=vmax)
-    axes[1][1].imshow(np.where(merged_score >= merged_threshold, 1.0, np.nan), aspect="auto", origin="lower", cmap="plasma", alpha=0.22)
-    axes[1][1].imshow(np.where(merged_mask, 1.0, np.nan), aspect="auto", origin="lower", cmap="autumn", alpha=0.55)
+    axes[1][1].imshow(display_corrected, aspect="auto", origin="lower", cmap="gray", vmin=vmin, vmax=vmax)
+    axes[1][1].imshow(np.where(display_score >= merged_threshold, 1.0, np.nan), aspect="auto", origin="lower", cmap="plasma", alpha=0.22)
+    axes[1][1].imshow(np.where(display_mask, 1.0, np.nan), aspect="auto", origin="lower", cmap="autumn", alpha=0.55)
     axes[1][1].set_title(f"Final overlay | threshold={merged_threshold:.3f}")
 
     ignored_rows = np.flatnonzero(~valid_row_mask)
@@ -1140,13 +1301,19 @@ def plot_merged_debug(pipeline_result: dict[str, Any], figsize: tuple[int, int] 
         for row in axes:
             for ax in row:
                 if low_block.size > 0:
-                    ax.axhspan(low_block[0], low_block[-1], color="black", alpha=0.12)
+                    if display_transposed:
+                        ax.axvspan(low_block[0], low_block[-1], color="black", alpha=0.12)
+                    else:
+                        ax.axhspan(low_block[0], low_block[-1], color="black", alpha=0.12)
                 if high_block.size > 0:
-                    ax.axhspan(high_block[0], high_block[-1], color="black", alpha=0.12)
+                    if display_transposed:
+                        ax.axvspan(high_block[0], high_block[-1], color="black", alpha=0.12)
+                    else:
+                        ax.axhspan(high_block[0], high_block[-1], color="black", alpha=0.12)
 
     for row in axes:
         for ax in row:
-            ax.set_xlabel("Time bin")
-            ax.set_ylabel("Frequency row")
+            ax.set_xlabel("Frequency bin")
+            ax.set_ylabel("Time bin")
 
     return fig, axes
