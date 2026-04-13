@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +20,10 @@ from sklearn.neighbors import NearestNeighbors
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
+DINO_IMAGE_TRANSFORM = T.Compose([
+    T.ToTensor(),
+    T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+])
 
 
 @dataclass
@@ -48,39 +52,35 @@ class WidebandChunkConfig:
     frontend_reference_q: float = 75.0
     frontend_smooth_sigma: float = 12.0
     frontend_max_boost_db: float = 12.0
+    dino_max_height_px: int | None = None
+    dino_max_width_px: int | None = None
     parallel_backend: str = "serial"
     max_workers: int = 1
 
 
 def infer_input_kind(input_path: str | Path, explicit_kind: str = "auto") -> str:
-    if explicit_kind in {"pgm", "sigmf"}:
-        return explicit_kind
+    if explicit_kind in {"pgm", "sigmf", "tensor_npy", "npy"}:
+        return "tensor_npy" if explicit_kind == "npy" else explicit_kind
     suffix = Path(input_path).suffix.lower()
     if suffix == ".pgm":
         return "pgm"
+    if suffix == ".npy":
+        return "tensor_npy"
     if suffix == ".sigmf-meta":
         return "sigmf"
     raise ValueError(f"Unsupported input type for {input_path}")
 
 
-def infer_channel_from_filename(path: str | Path) -> int | None:
-    match = re.search(r"_ch(\d+)_|ch(\d+)", str(path))
-    if not match:
-        return None
-    for group in match.groups():
-        if group is not None:
-            return int(group)
-    return None
+def input_kind_requires_display_transpose(input_kind: str | None) -> bool:
+    return input_kind in {"pgm", "tensor_npy"}
 
 
-def load_usrp_spectrogram_summary(summary_path: str | Path | None) -> dict[str, Any] | None:
-    if summary_path is None:
-        return None
-    summary_file = Path(summary_path)
-    if not summary_file.exists():
-        return None
-    with summary_file.open("r") as f:
-        return json.load(f)
+def has_calibrated_frequency_axis(input_record: dict[str, Any]) -> bool:
+    calibrated = input_record.get("frequency_axis_calibrated")
+    if calibrated is not None:
+        return bool(calibrated)
+    sample_rate_hz = input_record.get("sample_rate_hz")
+    return sample_rate_hz is not None and float(sample_rate_hz) > 0.0
 
 
 def read_pgm_raw(path: str | Path) -> np.ndarray:
@@ -114,6 +114,27 @@ def read_pgm_raw(path: str | Path) -> np.ndarray:
 
 def read_pgm(path: str | Path) -> np.ndarray:
     return read_pgm_raw(path)
+
+
+def read_complex_tensor_npy(path: str | Path) -> np.ndarray:
+    path = Path(path)
+    arr = np.load(path, allow_pickle=False)
+    if arr.ndim != 2:
+        raise ValueError(f"{path.name}: expected a 2D tensor snapshot, got shape {arr.shape}")
+    if not np.iscomplexobj(arr):
+        raise ValueError(f"{path.name}: expected complex64 tensor data")
+    return np.ascontiguousarray(arr.astype(np.complex64, copy=False))
+
+
+def resize_float_image(image: np.ndarray, width: int, height: int, resample: int = Image.BILINEAR) -> np.ndarray:
+    image = np.asarray(image, dtype=np.float32)
+    if image.ndim != 2:
+        raise ValueError(f"Expected a 2D float image, got shape {image.shape}")
+    width = max(1, int(width))
+    height = max(1, int(height))
+    pil_image = Image.fromarray(image, mode="F")
+    resized = pil_image.resize((width, height), resample=resample)
+    return np.asarray(resized, dtype=np.float32)
 
 
 def read_sigmf_meta(meta_path: str | Path):
@@ -233,38 +254,61 @@ def load_input_record(
     sigmf_channel: int = 0,
     sigmf_window_start_s: float = 0.0,
     sigmf_window_duration_s: float | None = 1.0,
-    usrp_summary_path: str | Path | None = None,
+    tensor_target_height: int | None = None,
+    tensor_target_width: int | None = None,
 ) -> dict[str, Any]:
     input_path = Path(input_path)
     resolved_kind = infer_input_kind(input_path, input_kind)
     if resolved_kind == "pgm":
-        summary = load_usrp_spectrogram_summary(usrp_summary_path)
-        channel = infer_channel_from_filename(input_path)
         pgm_img = read_pgm_raw(input_path)
         sxx_db = np.ascontiguousarray(pgm_img.T)
         time_axis_s = np.arange(pgm_img.shape[0], dtype=np.float32)
         center_frequency_hz = None
         sample_rate_hz = None
-        if summary is not None and channel is not None:
-            cfg = summary.get("channel_configs", {}).get(str(channel), {})
-            sample_rate_hz = float(cfg.get("sample_rate_hz", 0.0)) if cfg.get("sample_rate_hz") is not None else None
-            center_frequency_hz = float(cfg.get("center_freq_hz", 0.0)) if cfg.get("center_freq_hz") is not None else None
-        if sample_rate_hz is not None and sample_rate_hz > 0:
-            half_span = 0.5 * sample_rate_hz
-            freq_axis_hz = np.linspace(-half_span, half_span, sxx_db.shape[0], endpoint=False, dtype=np.float32)
-            if center_frequency_hz is not None:
-                freq_axis_hz = freq_axis_hz + center_frequency_hz
-        else:
-            freq_axis_hz = np.arange(sxx_db.shape[0], dtype=np.float32)
+        freq_axis_hz = np.arange(sxx_db.shape[0], dtype=np.float32)
         return {
             "input_kind": "pgm",
             "input_path": str(input_path),
             "sxx_db": sxx_db.astype(np.float32),
             "display_sxx_db": pgm_img.astype(np.float32),
+            "display_transposed": True,
+            "frequency_axis_calibrated": sample_rate_hz is not None and sample_rate_hz > 0,
             "freq_axis_hz": freq_axis_hz.astype(np.float32),
             "time_axis_s": time_axis_s,
             "center_frequency_hz": center_frequency_hz,
             "sample_rate_hz": sample_rate_hz,
+            "annotations": [],
+        }
+
+    if resolved_kind == "tensor_npy":
+        complex_tensor = read_complex_tensor_npy(input_path)
+        power_db = (10.0 * np.log10(np.maximum(np.abs(complex_tensor) ** 2, 1e-12))).astype(np.float32)
+        display_power_db = power_db
+        if tensor_target_height is not None and tensor_target_width is not None:
+            display_power_db = resize_float_image(
+                display_power_db,
+                width=int(tensor_target_width),
+                height=int(tensor_target_height),
+                resample=Image.BILINEAR,
+            )
+        sxx_db = np.ascontiguousarray(display_power_db.T)
+        time_axis_s = np.arange(display_power_db.shape[0], dtype=np.float32)
+        center_frequency_hz = None
+        sample_rate_hz = None
+        freq_axis_hz = np.arange(sxx_db.shape[0], dtype=np.float32)
+        return {
+            "input_kind": "tensor_npy",
+            "input_path": str(input_path),
+            "sxx_db": sxx_db.astype(np.float32),
+            "display_sxx_db": display_power_db.astype(np.float32),
+            "display_transposed": True,
+            "frequency_axis_calibrated": sample_rate_hz is not None and sample_rate_hz > 0,
+            "freq_axis_hz": freq_axis_hz.astype(np.float32),
+            "time_axis_s": time_axis_s,
+            "center_frequency_hz": center_frequency_hz,
+            "sample_rate_hz": sample_rate_hz,
+            "raw_tensor_shape": tuple(int(v) for v in complex_tensor.shape),
+            "resized_tensor_shape": tuple(int(v) for v in display_power_db.shape),
             "annotations": [],
         }
 
@@ -286,12 +330,53 @@ def load_input_record(
         "input_kind": "sigmf",
         "input_path": str(input_path),
         "sxx_db": sxx_db,
+        "display_transposed": False,
+        "frequency_axis_calibrated": True,
         "freq_axis_hz": freq_axis_hz,
         "time_axis_s": time_axis_s,
         "center_frequency_hz": meta["center_frequency_hz"],
         "sample_rate_hz": meta["sample_rate_hz"],
         "annotations": meta["annotations"],
     }
+
+
+def adapt_chunk_config_for_input_record(
+    input_record: dict[str, Any],
+    cfg: WidebandChunkConfig,
+    target_chunk_rows: int = 512,
+    target_overlap_rows: int = 128,
+) -> WidebandChunkConfig:
+    freq_axis_hz = np.asarray(input_record.get("freq_axis_hz", []), dtype=np.float32).reshape(-1)
+    if freq_axis_hz.size < 2:
+        return cfg
+
+    bin_hz = float(np.median(np.abs(np.diff(freq_axis_hz))))
+    if not np.isfinite(bin_hz) or bin_hz <= 0.0:
+        return cfg
+
+    input_kind = input_record.get("input_kind")
+    if input_kind != "tensor_npy":
+        return cfg
+
+    calibrated_axis = has_calibrated_frequency_axis(input_record)
+
+    num_rows = int(freq_axis_hz.size)
+    patch_size = 16
+    target_chunk_rows = int(max(patch_size * 2, target_chunk_rows))
+    target_overlap_rows = int(max(patch_size, min(target_overlap_rows, target_chunk_rows - patch_size)))
+    target_chunk_rows = int(min(num_rows, max(target_chunk_rows, patch_size)))
+    target_overlap_rows = int(min(target_overlap_rows, max(0, target_chunk_rows - patch_size)))
+
+    chunk_bandwidth_hz = float(target_chunk_rows * bin_hz)
+    chunk_overlap_hz = float(target_overlap_rows * bin_hz)
+
+    return replace(
+        cfg,
+        chunk_bandwidth_hz=chunk_bandwidth_hz,
+        chunk_overlap_hz=chunk_overlap_hz,
+        ignore_sideband_percent=0.0,
+        ignore_sideband_hz=(cfg.ignore_sideband_hz if cfg.ignore_sideband_hz is not None else 7.0e6) if calibrated_axis else None,
+    )
 
 
 def apply_global_frontend_correction(
@@ -509,13 +594,40 @@ def _prep_dino_image(img_rgb: Image.Image, patch_size: int) -> Image.Image:
     return img_rgb.crop((0, 0, width, height))
 
 
-def _extract_dino_features_from_rgb(img_rgb: Image.Image, model, patch_size: int, device: str):
-    img_rgb = _prep_dino_image(img_rgb, patch_size)
-    transform = T.Compose([
-        T.ToTensor(),
-        T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
-    ])
-    x = transform(img_rgb).unsqueeze(0).to(device)
+def _resize_dino_image_if_needed(
+    img_rgb: Image.Image,
+    patch_size: int,
+    max_height_px: int | None = None,
+    max_width_px: int | None = None,
+) -> Image.Image:
+    width, height = img_rgb.size
+    scale = 1.0
+    if max_width_px is not None and width > int(max_width_px):
+        scale = min(scale, float(max_width_px) / float(width))
+    if max_height_px is not None and height > int(max_height_px):
+        scale = min(scale, float(max_height_px) / float(height))
+    if scale < 1.0:
+        new_width = max(int(patch_size * 2), int(round(width * scale)))
+        new_height = max(int(patch_size * 2), int(round(height * scale)))
+        img_rgb = img_rgb.resize((new_width, new_height), Image.BILINEAR)
+    return _prep_dino_image(img_rgb, patch_size)
+
+
+def _extract_dino_features_from_rgb(
+    img_rgb: Image.Image,
+    model,
+    patch_size: int,
+    device: str,
+    max_height_px: int | None = None,
+    max_width_px: int | None = None,
+):
+    img_rgb = _resize_dino_image_if_needed(
+        img_rgb,
+        patch_size,
+        max_height_px=max_height_px,
+        max_width_px=max_width_px,
+    )
+    x = DINO_IMAGE_TRANSFORM(img_rgb).unsqueeze(0).to(device)
     with torch.no_grad():
         feat = model.get_intermediate_layers(x, n=1, reshape=True, norm=True)[0]
     feat = feat.squeeze().view(feat.shape[1], -1).permute(1, 0).cpu().numpy()
@@ -750,9 +862,18 @@ def dino_grouping_from_spectrogram(
     spatial_weight: float = 0.35,
     score_q: float = 0.60,
     min_component_size: int = 6,
+    dino_max_height_px: int | None = None,
+    dino_max_width_px: int | None = None,
 ):
     img_rgb, input_debug = build_signal_agnostic_dino_input(sxx_db_local, db_min=db_min, db_max=db_max)
-    feat_local, grid_h, grid_w, img_used = _extract_dino_features_from_rgb(img_rgb, model, patch_size, device)
+    feat_local, grid_h, grid_w, img_used = _extract_dino_features_from_rgb(
+        img_rgb,
+        model,
+        patch_size,
+        device,
+        max_height_px=dino_max_height_px,
+        max_width_px=dino_max_width_px,
+    )
     seed_patch = dino_seed_patch_map(sxx_db_local, grid_h, grid_w)
     x = np.asarray(feat_local, dtype=np.float32)
     d = min(12, x.shape[1], x.shape[0] - 1)
@@ -810,7 +931,14 @@ def _structure_tensor_components(x_n: np.ndarray, grad_sigma: float, integ_sigma
 
 
 def multi_scale_structure_tensor_gate(sxx_db_local: np.ndarray, patch_h: int, patch_w: int, scales: tuple[float, ...] = (0.8, 1.6, 3.2)):
-    residual_db, residual_n, background = residual_background_spectrogram(sxx_db_local)
+    sxx_db_local = np.asarray(sxx_db_local, dtype=np.float32)
+    work_rows = min(int(sxx_db_local.shape[0]), max(int(patch_h * 8), int(patch_h * 2)))
+    work_cols = min(int(sxx_db_local.shape[1]), max(int(patch_w * 8), int(patch_w * 2)))
+    work_sxx_db = sxx_db_local
+    if work_rows < int(sxx_db_local.shape[0]) or work_cols < int(sxx_db_local.shape[1]):
+        work_sxx_db = resize_float_image(sxx_db_local, width=work_cols, height=work_rows, resample=Image.BILINEAR)
+
+    residual_db, residual_n, background = residual_background_spectrogram(work_sxx_db)
     gate_stack = []
     coherence_stack = []
     energy_stack = []
@@ -821,9 +949,20 @@ def multi_scale_structure_tensor_gate(sxx_db_local: np.ndarray, patch_h: int, pa
         gate_stack.append((coherence_n * np.sqrt(np.maximum(energy_n, 0.0))).astype(np.float32))
         coherence_stack.append(coherence_n)
         energy_stack.append(energy_n)
-    coherence_px = np.max(np.stack(coherence_stack, axis=0), axis=0)
-    energy_px = np.max(np.stack(energy_stack, axis=0), axis=0)
-    gate_px = _normalize_map01_local(np.max(np.stack(gate_stack, axis=0), axis=0), 5.0, 99.0)
+    coherence_px = np.max(np.stack(coherence_stack, axis=0), axis=0).astype(np.float32)
+    energy_px = np.max(np.stack(energy_stack, axis=0), axis=0).astype(np.float32)
+    gate_px = _normalize_map01_local(np.max(np.stack(gate_stack, axis=0), axis=0), 5.0, 99.0).astype(np.float32)
+
+    if work_sxx_db.shape != sxx_db_local.shape:
+        target_rows = int(sxx_db_local.shape[0])
+        target_cols = int(sxx_db_local.shape[1])
+        background = resize_float_image(background, width=target_cols, height=target_rows, resample=Image.BILINEAR)
+        residual_db = resize_float_image(residual_db, width=target_cols, height=target_rows, resample=Image.BILINEAR)
+        residual_n = resize_float_image(residual_n, width=target_cols, height=target_rows, resample=Image.BILINEAR)
+        coherence_px = resize_float_image(coherence_px, width=target_cols, height=target_rows, resample=Image.BILINEAR)
+        energy_px = resize_float_image(energy_px, width=target_cols, height=target_rows, resample=Image.BILINEAR)
+        gate_px = resize_float_image(gate_px, width=target_cols, height=target_rows, resample=Image.BILINEAR)
+
     return {
         "background_db": background.astype(np.float32),
         "residual_db": residual_db.astype(np.float32),
@@ -835,6 +974,7 @@ def multi_scale_structure_tensor_gate(sxx_db_local: np.ndarray, patch_h: int, pa
         "energy_patch": patch_mean_map(energy_px, patch_h, patch_w),
         "gate_patch": patch_mean_map(gate_px, patch_h, patch_w),
         "residual_patch": patch_mean_map(residual_n, patch_h, patch_w),
+        "work_shape_px": (int(work_sxx_db.shape[0]), int(work_sxx_db.shape[1])),
     }
 
 
@@ -862,6 +1002,7 @@ def apply_coherence_gate_to_dino_result(dino_group: dict[str, Any], sxx_db_local
     out["coherence_gate_patch"] = gate_patch.astype(np.float32)
     out["coherence_energy_patch"] = coherence["energy_patch"].astype(np.float32)
     out["coherence_residual_patch"] = coherence["residual_patch"].astype(np.float32)
+    out["coherence_work_shape_px"] = tuple(int(v) for v in coherence["work_shape_px"])
     return out
 
 
@@ -937,6 +1078,13 @@ def run_chunk_detector(
     valid_row_mask: np.ndarray | None = None,
 ) -> dict[str, Any]:
     t0 = time.perf_counter()
+    effective_dino_max_height_px = cfg.dino_max_height_px
+    effective_dino_max_width_px = cfg.dino_max_width_px
+    if str(device).lower() == "cpu":
+        if effective_dino_max_height_px is None:
+            effective_dino_max_height_px = 512
+        if effective_dino_max_width_px is None:
+            effective_dino_max_width_px = 320
     dino_group = dino_grouping_from_spectrogram(
         sxx_db_chunk,
         model=model,
@@ -948,6 +1096,8 @@ def run_chunk_detector(
         spatial_weight=cfg.dino_group_spatial_weight,
         score_q=cfg.dino_group_score_q,
         min_component_size=cfg.min_component_size,
+        dino_max_height_px=effective_dino_max_height_px,
+        dino_max_width_px=effective_dino_max_width_px,
     )
     t1 = time.perf_counter()
     dino_gated = apply_coherence_gate_to_dino_result(
@@ -1011,6 +1161,7 @@ def run_chunk_detector(
             "fuse_ms": (t3 - t2) * 1000.0,
             "total_ms": (t3 - t0) * 1000.0,
         },
+        "dino_input_size_px": tuple(int(v) for v in dino_group["input_img"].size[::-1]),
     }
 
 
@@ -1076,11 +1227,13 @@ def run_chunked_pipeline(
     cfg: WidebandChunkConfig,
 ) -> dict[str, Any]:
     t0 = time.perf_counter()
+    calibrated_axis = has_calibrated_frequency_axis(input_record)
+    effective_ignore_sideband_hz = cfg.ignore_sideband_hz if calibrated_axis else None
     ignore_info = compute_ignore_sideband_rows(
         input_record["freq_axis_hz"],
         ignore_sideband_percent=cfg.ignore_sideband_percent,
         min_keep_rows=max(int(patch_size), 16),
-        ignore_sideband_hz=cfg.ignore_sideband_hz,
+        ignore_sideband_hz=effective_ignore_sideband_hz,
     )
     valid_row_mask = np.asarray(ignore_info["valid_row_mask"], dtype=bool)
     correction = apply_global_frontend_correction(
@@ -1127,6 +1280,8 @@ def run_chunked_pipeline(
         "frontend": correction,
         "corrected_sxx_db": corrected_sxx_db,
         "ignore_sideband": ignore_info,
+        "effective_ignore_sideband_hz": effective_ignore_sideband_hz,
+        "frequency_axis_calibrated": calibrated_axis,
         "chunk_plan": chunk_plan,
         "chunk_results": chunk_results,
         **merged,
@@ -1147,7 +1302,7 @@ def plot_frontend_overview(pipeline_result: dict[str, Any], figsize: tuple[int, 
     valid_row_mask = np.asarray(ignore_info.get("valid_row_mask", np.ones(corrected_sxx_db.shape[0], dtype=bool)), dtype=bool)
     freq_axis_hz = np.asarray(record["freq_axis_hz"], dtype=np.float32)
     display_raw = np.asarray(record.get("display_sxx_db", record["sxx_db"]), dtype=np.float32)
-    display_transposed = record.get("input_kind") == "pgm"
+    display_transposed = bool(record.get("display_transposed", input_kind_requires_display_transpose(record.get("input_kind"))))
     display_corrected = corrected_sxx_db.T if display_transposed else corrected_sxx_db
     raw_vmin, raw_vmax = _display_db_window(record["sxx_db"])
     corrected_vmin, corrected_vmax = _display_db_window(corrected_sxx_db)
@@ -1194,22 +1349,23 @@ def plot_frontend_overview(pipeline_result: dict[str, Any], figsize: tuple[int, 
 def plot_chunk_examples(pipeline_result: dict[str, Any], max_chunks: int = 4, figsize: tuple[int, int] = (22, 5)):
     chunk_results = pipeline_result["chunk_results"][: max(1, int(max_chunks))]
     input_kind = pipeline_result["input_record"].get("input_kind")
+    display_transposed = bool(pipeline_result["input_record"].get("display_transposed", input_kind_requires_display_transpose(input_kind)))
     fig, axes = plt.subplots(len(chunk_results), 4, figsize=(figsize[0], figsize[1] * len(chunk_results)), constrained_layout=True)
     if len(chunk_results) == 1:
         axes = np.expand_dims(axes, axis=0)
     for row_idx, chunk in enumerate(chunk_results):
         tile = pipeline_result["corrected_sxx_db"][chunk["row_start"]:chunk["row_stop"], :]
-        display_tile = tile.T if input_kind == "pgm" else tile
-        display_mask = chunk["mask_px"].T if input_kind == "pgm" else chunk["mask_px"]
+        display_tile = tile.T if display_transposed else tile
+        display_mask = chunk["mask_px"].T if display_transposed else chunk["mask_px"]
         dino = chunk["dino_gated"]
         axes[row_idx][0].imshow(display_tile, aspect="auto", origin="lower", cmap="viridis")
-        axes[row_idx][0].set_title(f"Chunk {chunk['chunk_index']} corrected tile")
+        axes[row_idx][0].set_title(f"Spectrogram subsection {chunk['chunk_index']} corrected tile")
         axes[row_idx][1].imshow(dino["input_img"])
         axes[row_idx][1].set_title("DINO input")
         axes[row_idx][2].imshow(chunk["strict_patch"], cmap="magma", vmin=0.0, vmax=1.0, interpolation="nearest")
-        axes[row_idx][2].set_title("Chunk strict patch score")
+        axes[row_idx][2].set_title("Subsection strict patch score")
         axes[row_idx][3].imshow(display_mask, cmap="gray", vmin=0.0, vmax=1.0)
-        axes[row_idx][3].set_title("Chunk pixel mask")
+        axes[row_idx][3].set_title("Subsection pixel mask")
         for ax in axes[row_idx]:
             ax.set_xticks([])
             ax.set_yticks([])
@@ -1222,7 +1378,7 @@ def plot_merged_detection(pipeline_result: dict[str, Any], figsize: tuple[int, i
     merged_mask = pipeline_result["merged_mask"]
     merged_support = np.asarray(pipeline_result.get("merged_support", np.ones_like(merged_mask, dtype=bool)), dtype=bool)
     valid_row_mask = np.asarray(pipeline_result.get("valid_row_mask", np.ones(corrected_sxx_db.shape[0], dtype=bool)), dtype=bool)
-    display_transposed = pipeline_result["input_record"].get("input_kind") == "pgm"
+    display_transposed = bool(pipeline_result["input_record"].get("display_transposed", input_kind_requires_display_transpose(pipeline_result["input_record"].get("input_kind"))))
     display_corrected = corrected_sxx_db.T if display_transposed else corrected_sxx_db
     display_score = merged_score.T if display_transposed else merged_score
     display_mask = merged_mask.T if display_transposed else merged_mask
@@ -1268,7 +1424,7 @@ def plot_merged_debug(pipeline_result: dict[str, Any], figsize: tuple[int, int] 
     merged_mask = np.asarray(pipeline_result["merged_mask"], dtype=bool)
     merged_threshold = float(pipeline_result.get("merged_threshold", 0.0))
     valid_row_mask = np.asarray(pipeline_result.get("valid_row_mask", np.ones(corrected_sxx_db.shape[0], dtype=bool)), dtype=bool)
-    display_transposed = pipeline_result["input_record"].get("input_kind") == "pgm"
+    display_transposed = bool(pipeline_result["input_record"].get("display_transposed", input_kind_requires_display_transpose(pipeline_result["input_record"].get("input_kind"))))
     display_corrected = corrected_sxx_db.T if display_transposed else corrected_sxx_db
     display_base_score = merged_base_score.T if display_transposed else merged_base_score
     display_companion = merged_companion.T if display_transposed else merged_companion
