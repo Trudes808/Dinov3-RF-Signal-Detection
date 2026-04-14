@@ -1205,6 +1205,65 @@ def _boxes_overlap(box_a: dict[str, Any], box_b: dict[str, Any]) -> bool:
     )
 
 
+def _boxes_should_merge(box_a: dict[str, Any], box_b: dict[str, Any]) -> bool:
+    if not _boxes_overlap(box_a, box_b):
+        return False
+
+    role_a = str(box_a.get("split_role", "unsplit"))
+    role_b = str(box_b.get("split_role", "unsplit"))
+    if {role_a, role_b} == {"persistent_carrier", "transient_wideband_burst"}:
+        return False
+    return True
+
+
+def _merge_box_cluster(cluster: list[dict[str, Any]]) -> dict[str, Any]:
+    if not cluster:
+        raise ValueError("Cannot merge an empty box cluster")
+
+    freq_start = min(int(box["freq_start"]) for box in cluster)
+    freq_stop = max(int(box["freq_stop"]) for box in cluster)
+    time_start = min(int(box["time_start"]) for box in cluster)
+    time_stop = max(int(box["time_stop"]) for box in cluster)
+    filled_area = int(sum(int(box.get("filled_area", 0)) for box in cluster))
+    bbox_area = max(int(freq_stop - freq_start) * int(time_stop - time_start), 1)
+    score_weight = max(filled_area, 1)
+    score_mean = float(
+        sum(float(box.get("score_mean", 0.0)) * max(int(box.get("filled_area", 0)), 1) for box in cluster)
+        / float(score_weight)
+    )
+    split_roles = sorted({str(box.get("split_role", "unsplit")) for box in cluster})
+    split_role = split_roles[0] if len(split_roles) == 1 else "mixed"
+    source_chunk_indices = sorted({
+        int(chunk_index)
+        for box in cluster
+        for chunk_index in box.get("source_chunk_indices", [])
+    })
+    parent_component_ids = sorted({
+        int(parent_component_id)
+        for box in cluster
+        if box.get("parent_component_id") is not None
+        for parent_component_id in [box.get("parent_component_id")]
+    })
+    return {
+        "freq_start": freq_start,
+        "freq_stop": freq_stop,
+        "time_start": time_start,
+        "time_stop": time_stop,
+        "freq_span": int(freq_stop - freq_start),
+        "time_span": int(time_stop - time_start),
+        "filled_area": filled_area,
+        "density": float(filled_area / bbox_area),
+        "score_mean": score_mean,
+        "score_peak": float(max(float(box.get("score_peak", 0.0)) for box in cluster)),
+        "split_role": split_role,
+        "split_roles": split_roles,
+        "split_applied": bool(any(bool(box.get("split_applied", False)) for box in cluster)),
+        "source_box_count": len(cluster),
+        "source_chunk_indices": source_chunk_indices,
+        "parent_component_ids": parent_component_ids,
+    }
+
+
 def _boxes_to_mask(
     shape: tuple[int, int],
     boxes: list[dict[str, Any]],
@@ -1257,6 +1316,9 @@ def _project_chunk_boxes_to_global(
                 "density": float(box.get("density", 0.0)),
                 "score_mean": float(box.get("score_mean", 0.0)),
                 "score_peak": float(box.get("score_peak", 0.0)),
+                "split_role": str(box.get("split_role", "unsplit")),
+                "split_applied": bool(box.get("split_applied", False)),
+                "parent_component_id": box.get("parent_component_id"),
                 "source_chunk_indices": [chunk_index],
                 "source_row_start": row_start,
                 "source_row_stop": row_stop,
@@ -1314,6 +1376,38 @@ def _merge_projected_subsection_boxes(
             "grouped_mask": np.zeros(global_shape, dtype=bool),
             "source_boxes": [],
             "source_mask": source_mask.astype(bool),
+        }
+
+    if any(bool(box.get("split_applied", False)) for box in projected_boxes):
+        merged_boxes: list[dict[str, Any]] = []
+        visited = [False] * len(projected_boxes)
+        for start_index in range(len(projected_boxes)):
+            if visited[start_index]:
+                continue
+            pending = [start_index]
+            visited[start_index] = True
+            cluster_indices: list[int] = []
+            while pending:
+                current_index = pending.pop()
+                cluster_indices.append(current_index)
+                current_box = projected_boxes[current_index]
+                for other_index, other_box in enumerate(projected_boxes):
+                    if visited[other_index]:
+                        continue
+                    if _boxes_should_merge(current_box, other_box):
+                        visited[other_index] = True
+                        pending.append(other_index)
+
+            cluster = [projected_boxes[index] for index in cluster_indices]
+            merged_boxes.append(_merge_box_cluster(cluster))
+
+        grouped_mask = _boxes_to_mask(global_shape, merged_boxes, valid_row_mask=valid_row_mask)
+        return {
+            "boxes": merged_boxes,
+            "grouped_mask": grouped_mask.astype(bool),
+            "source_boxes": projected_boxes,
+            "source_mask": source_mask.astype(bool),
+            "grouping": None,
         }
 
     grouping = group_signal_mask_regions(
