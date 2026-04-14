@@ -11,6 +11,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torchvision.transforms as T
+from matplotlib.patches import Rectangle
 from PIL import Image
 from scipy import ndimage, signal
 from scipy import ndimage as ndi
@@ -48,6 +49,13 @@ class WidebandChunkConfig:
     companion_temporal_contrast_gain: float = 0.35
     companion_coherence_gain: float = 0.20
     min_component_size: int = 6
+    grouping_seed_score_q: float = 0.72
+    grouping_bridge_freq_px: int = 33
+    grouping_bridge_time_px: int = 5
+    grouping_min_component_size: int = 24
+    grouping_min_freq_span_px: int = 18
+    grouping_min_time_span_px: int = 2
+    grouping_min_density: float = 0.06
     frontend_row_q: float = 25.0
     frontend_reference_q: float = 75.0
     frontend_smooth_sigma: float = 12.0
@@ -55,6 +63,7 @@ class WidebandChunkConfig:
     dino_max_height_px: int | None = None
     dino_max_width_px: int | None = None
     use_coherence_gate: bool = False
+    use_texture_debug: bool = False
     coherence_max_height_px: int | None = None
     coherence_max_width_px: int | None = None
     parallel_backend: str = "serial"
@@ -787,6 +796,205 @@ def _smooth_binary_label_map(label_map: np.ndarray, iters: int = 2, min_componen
     return out
 
 
+def group_signal_mask_regions(
+    mask: np.ndarray,
+    score_map: np.ndarray | None = None,
+    valid_row_mask: np.ndarray | None = None,
+    bridge_freq_px: int = 21,
+    bridge_time_px: int = 3,
+    min_component_size: int = 24,
+    min_freq_span_px: int = 12,
+    min_time_span_px: int = 1,
+    min_density: float = 0.08,
+) -> dict[str, Any]:
+    raw_mask = np.asarray(mask, dtype=bool)
+    if raw_mask.ndim != 2:
+        raise ValueError(f"Expected a 2D mask, got shape {raw_mask.shape}")
+
+    working_mask = raw_mask.copy()
+    if valid_row_mask is not None:
+        valid_row_mask = np.asarray(valid_row_mask, dtype=bool).reshape(-1)
+        if valid_row_mask.shape[0] != working_mask.shape[0]:
+            raise ValueError("valid_row_mask length must match mask rows")
+        working_mask[~valid_row_mask, :] = False
+
+    structure = np.ones(
+        (
+            max(1, int(bridge_freq_px)),
+            max(1, int(bridge_time_px)),
+        ),
+        dtype=bool,
+    )
+    bridged_mask = ndimage.binary_closing(working_mask, structure=structure)
+    bridged_mask = ndimage.binary_fill_holes(bridged_mask)
+
+    component_labels, n_components = ndimage.label(bridged_mask)
+    grouped_mask = np.zeros_like(working_mask, dtype=bool)
+    boxes: list[dict[str, int | float]] = []
+    component_rows: list[dict[str, int | float]] = []
+
+    score_map_arr = None if score_map is None else np.asarray(score_map, dtype=np.float32)
+    active_scores = None
+    if score_map_arr is not None and np.any(working_mask):
+        active_scores = score_map_arr[working_mask]
+    peak_score_floor = float(np.quantile(active_scores, 0.50)) if active_scores is not None and active_scores.size else 0.0
+
+    for component_id in range(1, int(n_components) + 1):
+        component_mask = component_labels == component_id
+        if not np.any(component_mask):
+            continue
+
+        row_coords, col_coords = np.nonzero(component_mask)
+        freq_start = int(row_coords.min())
+        freq_stop = int(row_coords.max()) + 1
+        time_start = int(col_coords.min())
+        time_stop = int(col_coords.max()) + 1
+        freq_span = int(freq_stop - freq_start)
+        time_span = int(time_stop - time_start)
+        bbox_area = max(freq_span * time_span, 1)
+        filled_area = int(np.count_nonzero(component_mask))
+        density = float(filled_area / bbox_area)
+
+        score_peak = float(np.max(score_map_arr[component_mask])) if score_map_arr is not None and np.any(component_mask) else 0.0
+        score_mean = float(np.mean(score_map_arr[component_mask])) if score_map_arr is not None and np.any(component_mask) else 0.0
+        keep_component = (
+            filled_area >= int(min_component_size)
+            and freq_span >= int(min_freq_span_px)
+            and time_span >= int(min_time_span_px)
+            and (density >= float(min_density) or score_peak >= peak_score_floor)
+        )
+
+        component_rows.append({
+            "component_id": int(component_id),
+            "freq_start": freq_start,
+            "freq_stop": freq_stop,
+            "time_start": time_start,
+            "time_stop": time_stop,
+            "freq_span": freq_span,
+            "time_span": time_span,
+            "filled_area": filled_area,
+            "bbox_area": int(bbox_area),
+            "density": density,
+            "score_mean": score_mean,
+            "score_peak": score_peak,
+            "kept": bool(keep_component),
+        })
+
+        if not keep_component:
+            continue
+
+        grouped_mask[freq_start:freq_stop, time_start:time_stop] = True
+        boxes.append({
+            "freq_start": freq_start,
+            "freq_stop": freq_stop,
+            "time_start": time_start,
+            "time_stop": time_stop,
+            "freq_span": freq_span,
+            "time_span": time_span,
+            "filled_area": filled_area,
+            "density": density,
+            "score_mean": score_mean,
+            "score_peak": score_peak,
+        })
+
+    if valid_row_mask is not None:
+        grouped_mask[~valid_row_mask, :] = False
+
+    return {
+        "seed_mask": working_mask.astype(bool),
+        "bridged_mask": bridged_mask.astype(bool),
+        "grouped_mask": grouped_mask.astype(bool),
+        "boxes": boxes,
+        "components": component_rows,
+        "peak_score_floor": peak_score_floor,
+    }
+
+
+def build_grouped_detection_regions(
+    merged_score: np.ndarray,
+    merged_mask: np.ndarray,
+    merged_support: np.ndarray,
+    valid_row_mask: np.ndarray | None = None,
+    seed_score_q: float = 0.72,
+    bridge_freq_px: int = 33,
+    bridge_time_px: int = 5,
+    min_component_size: int = 24,
+    min_freq_span_px: int = 18,
+    min_time_span_px: int = 2,
+    min_density: float = 0.06,
+) -> dict[str, Any]:
+    merged_score = np.asarray(merged_score, dtype=np.float32)
+    merged_mask = np.asarray(merged_mask, dtype=bool)
+    merged_support = np.asarray(merged_support, dtype=bool)
+    if merged_score.shape != merged_mask.shape or merged_score.shape != merged_support.shape:
+        raise ValueError("merged_score, merged_mask, and merged_support must share the same shape")
+
+    if valid_row_mask is None:
+        valid_row_mask = np.ones(merged_score.shape[0], dtype=bool)
+    else:
+        valid_row_mask = np.asarray(valid_row_mask, dtype=bool).reshape(-1)
+        if valid_row_mask.shape[0] != merged_score.shape[0]:
+            raise ValueError("valid_row_mask length must match the merged map rows")
+
+    valid_seed_mask = np.logical_and(valid_row_mask[:, None], merged_support)
+    valid_seed_scores = merged_score[valid_seed_mask]
+    seed_threshold = _robust_high_quantile_threshold(valid_seed_scores, seed_score_q) if valid_seed_scores.size else 1.0
+    seed_mask = np.logical_or(merged_mask, np.logical_and(merged_support, merged_score >= seed_threshold))
+    region_groups = group_signal_mask_regions(
+        seed_mask,
+        score_map=merged_score,
+        valid_row_mask=valid_row_mask,
+        bridge_freq_px=bridge_freq_px,
+        bridge_time_px=bridge_time_px,
+        min_component_size=min_component_size,
+        min_freq_span_px=min_freq_span_px,
+        min_time_span_px=min_time_span_px,
+        min_density=min_density,
+    )
+    region_groups["seed_threshold"] = float(seed_threshold)
+    region_groups["seed_score_q"] = float(seed_score_q)
+    region_groups["raw_mask_fraction"] = float(np.mean(merged_mask))
+    region_groups["grouped_mask_fraction"] = float(np.mean(np.asarray(region_groups["grouped_mask"], dtype=bool)))
+    return region_groups
+
+
+def _draw_signal_boxes(
+    ax,
+    boxes: list[dict[str, int | float]] | None,
+    display_transposed: bool,
+    edgecolor: str = "deepskyblue",
+    linewidth: float = 1.4,
+):
+    if not boxes:
+        return
+    for box in boxes:
+        freq_start = float(box["freq_start"])
+        freq_stop = float(box["freq_stop"])
+        time_start = float(box["time_start"])
+        time_stop = float(box["time_stop"])
+        if display_transposed:
+            x0 = freq_start
+            y0 = time_start
+            width = max(freq_stop - freq_start, 1.0)
+            height = max(time_stop - time_start, 1.0)
+        else:
+            x0 = time_start
+            y0 = freq_start
+            width = max(time_stop - time_start, 1.0)
+            height = max(freq_stop - freq_start, 1.0)
+        ax.add_patch(
+            Rectangle(
+                (x0, y0),
+                width,
+                height,
+                fill=False,
+                edgecolor=edgecolor,
+                linewidth=linewidth,
+                linestyle="-",
+            )
+        )
+
+
 def _feature_affinity_matrix(x_embed: np.ndarray, k: int = 8) -> np.ndarray:
     x_embed = np.asarray(x_embed, dtype=np.float32)
     n = x_embed.shape[0]
@@ -936,9 +1144,8 @@ def residual_background_spectrogram(sxx_db_local: np.ndarray, bg_percentile: flo
     x_db = np.asarray(sxx_db_local, dtype=np.float32)
     bg_freq = max(9, int(2 * max(1, x_db.shape[0] // 24) + 1))
     bg_time = max(9, int(2 * max(1, x_db.shape[1] // 24) + 1))
-    background = ndimage.percentile_filter(
+    background = ndimage.uniform_filter(
         x_db,
-        percentile=float(bg_percentile),
         size=(bg_freq, bg_time),
         mode="nearest",
     ).astype(np.float32)
@@ -1057,6 +1264,30 @@ def apply_coherence_gate_to_dino_result(
     out["coherence_gate_patch"] = gate_patch.astype(np.float32)
     out["coherence_energy_patch"] = coherence["energy_patch"].astype(np.float32)
     out["coherence_residual_patch"] = coherence["residual_patch"].astype(np.float32)
+    out["coherence_work_shape_px"] = tuple(int(v) for v in coherence["work_shape_px"])
+    return out
+
+
+def apply_coherence_gate_to_dino_result_from_maps(
+    dino_group: dict[str, Any],
+    coherence: dict[str, Any],
+    gate_floor: float = 0.25,
+    min_component_size: int = 3,
+):
+    raw_score = np.asarray(dino_group["score"], dtype=np.float32)
+    gated_score, _, gate_patch = _soft_gate_dino_score(raw_score, coherence["gate_patch"], floor=gate_floor)
+    thr = float(np.quantile(gated_score, 0.60))
+    mask = _smooth_binary_label_map((gated_score >= thr).astype(np.uint8), iters=1, min_component_size=min_component_size)
+    out = dict(dino_group)
+    out["score"] = gated_score.astype(np.float32)
+    out["mask"] = mask.astype(np.uint8)
+    out["threshold"] = thr
+    out["coherence_gate_px"] = np.asarray(coherence["gate_px"], dtype=np.float32)
+    out["coherence_energy_px"] = np.asarray(coherence["energy_px"], dtype=np.float32)
+    out["coherence_residual_px"] = np.asarray(coherence["residual_n"], dtype=np.float32)
+    out["coherence_gate_patch"] = gate_patch.astype(np.float32)
+    out["coherence_energy_patch"] = np.asarray(coherence["energy_patch"], dtype=np.float32)
+    out["coherence_residual_patch"] = np.asarray(coherence["residual_patch"], dtype=np.float32)
     out["coherence_work_shape_px"] = tuple(int(v) for v in coherence["work_shape_px"])
     return out
 
@@ -1273,19 +1504,24 @@ def run_chunk_detector(
         valid_row_mask=valid_row_mask,
     )
     t1 = time.perf_counter()
+    patch_h, patch_w = tuple(dino_group["shape"])
     if cfg.use_coherence_gate:
-        dino_gated = apply_coherence_gate_to_dino_result(
-            dino_group,
+        raw_coherence = multi_scale_structure_tensor_gate(
             sxx_db_chunk,
+            patch_h,
+            patch_w,
+            max_height_px=cfg.coherence_max_height_px,
+            max_width_px=cfg.coherence_max_width_px,
+        )
+        dino_gated = apply_coherence_gate_to_dino_result_from_maps(
+            dino_group,
+            raw_coherence,
             gate_floor=cfg.dino_coherence_gate_floor,
             min_component_size=max(3, cfg.min_component_size // 2),
-            coherence_max_height_px=cfg.coherence_max_height_px,
-            coherence_max_width_px=cfg.coherence_max_width_px,
         )
     else:
         dino_gated = bypass_coherence_gate_for_dino_result(dino_group, sxx_db_chunk)
     t2 = time.perf_counter()
-    patch_h, patch_w = tuple(dino_gated["shape"])
     dino_score_px_raw = _resize_patch_map_to_pixels_time_preserving(
         dino_gated["score"],
         sxx_db_chunk.shape[0],
@@ -1410,7 +1646,20 @@ def _chunk_blend_weights(length: int) -> np.ndarray:
     return (0.2 + 0.8 * base).astype(np.float32)
 
 
-def merge_chunk_results(global_shape: tuple[int, int], chunk_results: list[dict[str, Any]], final_score_q: float = 0.90, min_component_size: int = 6):
+def merge_chunk_results(
+    global_shape: tuple[int, int],
+    chunk_results: list[dict[str, Any]],
+    final_score_q: float = 0.90,
+    min_component_size: int = 6,
+    global_valid_row_mask: np.ndarray | None = None,
+    grouping_seed_score_q: float = 0.72,
+    grouping_bridge_freq_px: int = 33,
+    grouping_bridge_time_px: int = 5,
+    grouping_min_component_size: int = 24,
+    grouping_min_freq_span_px: int = 18,
+    grouping_min_time_span_px: int = 2,
+    grouping_min_density: float = 0.06,
+):
     merged_base_score = np.zeros(global_shape, dtype=np.float32)
     merged_support = np.zeros(global_shape, dtype=bool)
     merged_companion_sum = np.zeros(global_shape, dtype=np.float32)
@@ -1439,28 +1688,45 @@ def merge_chunk_results(global_shape: tuple[int, int], chunk_results: list[dict[
         95.0,
     )
     valid_row_mask = np.ones(global_shape[0], dtype=bool)
-    if chunk_results:
-        candidate_mask = chunk_results[0].get("valid_row_mask")
-        if candidate_mask is not None:
-            valid_row_mask = np.asarray(candidate_mask, dtype=bool).reshape(-1)
+    if global_valid_row_mask is not None:
+        valid_row_mask = np.asarray(global_valid_row_mask, dtype=bool).reshape(-1)
+        if valid_row_mask.shape[0] != global_shape[0]:
+            raise ValueError("global_valid_row_mask length must match global_shape rows")
     valid_scores = merged_score[np.logical_and(valid_row_mask[:, None], merged_support)]
     threshold = _robust_high_quantile_threshold(valid_scores, final_score_q) if valid_scores.size else 1.0
-    merged_mask = _smooth_binary_label_map(
+    raw_merged_mask = _smooth_binary_label_map(
         np.logical_and(merged_score >= threshold, merged_support).astype(np.uint8),
         iters=1,
         min_component_size=min_component_size,
     )
-    merged_mask[~valid_row_mask, :] = 0
+    raw_merged_mask[~valid_row_mask, :] = 0
     merged_score[~valid_row_mask, :] = 0.0
     merged_support[~valid_row_mask, :] = False
+    merged_region_groups = build_grouped_detection_regions(
+        merged_score=merged_score,
+        merged_mask=raw_merged_mask,
+        merged_support=merged_support,
+        valid_row_mask=valid_row_mask,
+        seed_score_q=grouping_seed_score_q,
+        bridge_freq_px=grouping_bridge_freq_px,
+        bridge_time_px=grouping_bridge_time_px,
+        min_component_size=max(int(grouping_min_component_size), int(min_component_size)),
+        min_freq_span_px=grouping_min_freq_span_px,
+        min_time_span_px=grouping_min_time_span_px,
+        min_density=grouping_min_density,
+    )
+    merged_mask = np.asarray(merged_region_groups["grouped_mask"], dtype=bool)
     return {
         "merged_score": merged_score.astype(np.float32),
         "merged_mask": merged_mask.astype(bool),
+        "raw_merged_mask": np.asarray(raw_merged_mask, dtype=bool),
         "merged_threshold": threshold,
         "valid_row_mask": valid_row_mask.astype(bool),
         "merged_support": merged_support.astype(bool),
         "merged_base_score": merged_base_score.astype(np.float32),
         "merged_companion": merged_companion.astype(np.float32),
+        "merged_boxes": list(merged_region_groups["boxes"]),
+        "merged_region_groups": merged_region_groups,
     }
 
 
@@ -1815,6 +2081,19 @@ def nonlocal_texture_recurrence_patch_map(input_gray01: np.ndarray, patch_h: int
     return score.astype(np.float32)
 
 
+def nonlocal_texture_recurrence_mask_from_gray(
+    input_gray01: np.ndarray,
+    patch_h: int,
+    patch_w: int,
+    k: int = 6,
+    q: float = 0.90,
+) -> tuple[np.ndarray, np.ndarray, float]:
+    texture_score = nonlocal_texture_recurrence_patch_map(input_gray01, patch_h, patch_w, k=k)
+    texture_thr = float(np.quantile(texture_score, float(np.clip(q, 0.50, 0.99))))
+    texture_mask = texture_score >= texture_thr
+    return texture_mask.astype(np.uint8), texture_score.astype(np.float32), texture_thr
+
+
 def _component_speckle_score(mask: np.ndarray, min_size: int = 6) -> float:
     mask_u8 = np.asarray(mask, dtype=np.uint8)
     active = float(np.count_nonzero(mask_u8))
@@ -2045,12 +2324,20 @@ def run_chunked_pipeline(
             cfg,
             valid_row_mask=chunk_valid_row_mask,
         )
-        chunk_results.append({**chunk, **detection, "valid_row_mask": valid_row_mask})
+        chunk_results.append({**chunk, **detection, "valid_row_mask": chunk_valid_row_mask.astype(bool)})
     merged = merge_chunk_results(
         corrected_sxx_db.shape,
         chunk_results,
         final_score_q=cfg.final_score_q,
         min_component_size=cfg.min_component_size,
+        global_valid_row_mask=valid_row_mask,
+        grouping_seed_score_q=cfg.grouping_seed_score_q,
+        grouping_bridge_freq_px=cfg.grouping_bridge_freq_px,
+        grouping_bridge_time_px=cfg.grouping_bridge_time_px,
+        grouping_min_component_size=cfg.grouping_min_component_size,
+        grouping_min_freq_span_px=cfg.grouping_min_freq_span_px,
+        grouping_min_time_span_px=cfg.grouping_min_time_span_px,
+        grouping_min_density=cfg.grouping_min_density,
     )
     t1 = time.perf_counter()
     return {
@@ -2161,6 +2448,7 @@ def plot_merged_detection(pipeline_result: dict[str, Any], figsize: tuple[int, i
     merged_score = pipeline_result["merged_score"]
     merged_mask = pipeline_result["merged_mask"]
     merged_support = np.asarray(pipeline_result.get("merged_support", np.ones_like(merged_mask, dtype=bool)), dtype=bool)
+    merged_boxes = list(pipeline_result.get("merged_boxes", []))
     valid_row_mask = np.asarray(pipeline_result.get("valid_row_mask", np.ones(corrected_sxx_db.shape[0], dtype=bool)), dtype=bool)
     display_transposed = bool(pipeline_result["input_record"].get("display_transposed", input_kind_requires_display_transpose(pipeline_result["input_record"].get("input_kind"))))
     display_corrected = corrected_sxx_db.T if display_transposed else corrected_sxx_db
@@ -2176,7 +2464,10 @@ def plot_merged_detection(pipeline_result: dict[str, Any], figsize: tuple[int, i
     axes[1].set_title("Merged strict score + support")
     axes[2].imshow(display_corrected, aspect="auto", origin="lower", cmap="gray", vmin=vmin, vmax=vmax, interpolation="nearest")
     axes[2].imshow(np.where(display_mask, 1.0, np.nan), aspect="auto", origin="lower", cmap="autumn", alpha=0.55, interpolation="nearest")
-    axes[2].set_title("Merged detection overlay")
+    axes[2].set_title(f"Grouped detection overlay ({len(merged_boxes)} boxes)")
+    _draw_signal_boxes(axes[0], merged_boxes, display_transposed)
+    _draw_signal_boxes(axes[1], merged_boxes, display_transposed)
+    _draw_signal_boxes(axes[2], merged_boxes, display_transposed)
     ignored_rows = np.flatnonzero(~valid_row_mask)
     if ignored_rows.size > 0:
         low_block = ignored_rows[ignored_rows < (corrected_sxx_db.shape[0] // 2)]
@@ -2219,11 +2510,23 @@ def _show_debug_panel(ax, panel: np.ndarray, title: str, display_transposed: boo
     ax.set_ylabel("Time bin")
 
 
-def _show_debug_overlay(ax, base: np.ndarray, overlay: np.ndarray, title: str, display_transposed: bool, base_vmin: float, base_vmax: float, overlay_cmap: str = "autumn", overlay_alpha: float = 0.5):
+def _show_debug_overlay(
+    ax,
+    base: np.ndarray,
+    overlay: np.ndarray,
+    title: str,
+    display_transposed: bool,
+    base_vmin: float,
+    base_vmax: float,
+    overlay_cmap: str = "autumn",
+    overlay_alpha: float = 0.5,
+    boxes: list[dict[str, int | float]] | None = None,
+):
     display_base = base.T if display_transposed else base
     display_overlay = overlay.T if display_transposed else overlay
     ax.imshow(display_base, aspect="auto", origin="lower", cmap="gray", vmin=base_vmin, vmax=base_vmax, interpolation="nearest")
     ax.imshow(np.where(display_overlay, 1.0, np.nan), aspect="auto", origin="lower", cmap=overlay_cmap, alpha=overlay_alpha, interpolation="nearest")
+    _draw_signal_boxes(ax, boxes, display_transposed)
     ax.set_title(title)
     ax.set_xlabel("Frequency bin")
     ax.set_ylabel("Time bin")
@@ -2264,6 +2567,7 @@ def plot_merged_debug(pipeline_result: dict[str, Any], figsize: tuple[int, int] 
     merged_score = np.asarray(pipeline_result["merged_score"], dtype=np.float32)
     merged_mask = np.asarray(pipeline_result["merged_mask"], dtype=bool)
     merged_support = np.asarray(pipeline_result.get("merged_support", np.zeros_like(corrected_sxx_db, dtype=bool)), dtype=bool)
+    merged_boxes = list(pipeline_result.get("merged_boxes", []))
     display_transposed, corrected_sxx_db, vmin, vmax = _debug_display_orientation(pipeline_result)
     debug_views = _build_merged_debug_views(pipeline_result)
     fig, axes = plt.subplots(1, 5, figsize=figsize, constrained_layout=True)
@@ -2272,15 +2576,74 @@ def plot_merged_debug(pipeline_result: dict[str, Any], figsize: tuple[int, int] 
     _show_debug_panel(axes[2], debug_views["dino_score"], "DINO score + support", display_transposed, "magma", 0.0, 1.0)
     support_display = debug_views["support"].T if display_transposed else debug_views["support"]
     axes[2].imshow(np.where(support_display, 1.0, np.nan), aspect="auto", origin="lower", cmap="winter", alpha=0.18, interpolation="nearest")
+    _draw_signal_boxes(axes[2], merged_boxes, display_transposed)
     _show_debug_panel(axes[3], debug_views["power"], "Normalized power", display_transposed, "cividis", 0.0, 1.0)
-    _show_debug_overlay(axes[4], corrected_sxx_db, merged_mask, "Final overlay", display_transposed, vmin, vmax)
+    _show_debug_overlay(axes[4], corrected_sxx_db, merged_mask, "Grouped final overlay", display_transposed, vmin, vmax, boxes=merged_boxes)
     return fig, axes
+
+
+def _compute_subsection_debug_maps(
+    pipeline_result: dict[str, Any],
+    chunk: dict[str, Any],
+    corrected_chunk: np.ndarray,
+) -> dict[str, np.ndarray | float]:
+    cache_version = 2
+    texture_source = "coherence"
+    texture_display = "score"
+    cached = chunk.get("_subsection_debug_cache")
+    if (
+        isinstance(cached, dict)
+        and int(cached.get("cache_version", 0)) == cache_version
+        and cached.get("texture_source") == texture_source
+        and cached.get("texture_display") == texture_display
+    ):
+        return cached
+    cfg = pipeline_result.get("config")
+    patch_h, patch_w = tuple(chunk["dino_group"]["shape"])
+    coherence = multi_scale_structure_tensor_gate(
+        corrected_chunk,
+        patch_h,
+        patch_w,
+        max_height_px=None if cfg is None else cfg.coherence_max_height_px,
+        max_width_px=None if cfg is None else cfg.coherence_max_width_px,
+    )
+    coherence_gray01 = np.asarray(np.clip(coherence["coherence_px"], 0.0, 1.0), dtype=np.float32)
+    if coherence_gray01.ndim == 2:
+        texture_mask_patch, texture_score_patch, texture_threshold = nonlocal_texture_recurrence_mask_from_gray(
+            coherence_gray01,
+            patch_h,
+            patch_w,
+            k=6,
+            q=0.90,
+        )
+    else:
+        texture_mask_patch = np.zeros((patch_h, patch_w), dtype=np.uint8)
+        texture_score_patch = np.zeros((patch_h, patch_w), dtype=np.float32)
+        texture_threshold = 1.0
+    texture_mask_px = _resize_patch_mask_to_pixels(texture_mask_patch.astype(np.float32), corrected_chunk.shape[0], corrected_chunk.shape[1])
+    texture_score_px = np.clip(
+        _resize_patch_map_to_pixels(texture_score_patch.astype(np.float32), corrected_chunk.shape[0], corrected_chunk.shape[1], Image.NEAREST),
+        0.0,
+        1.0,
+    ).astype(np.float32)
+    debug_maps = {
+        "cache_version": cache_version,
+        "coherence_px": np.asarray(coherence["coherence_px"], dtype=np.float32),
+        "texture_mask_px": texture_mask_px.astype(bool),
+        "texture_score_patch": texture_score_patch.astype(np.float32),
+        "texture_score_px": np.asarray(texture_score_px, dtype=np.float32),
+        "texture_threshold": float(texture_threshold),
+        "texture_source": texture_source,
+        "texture_display": texture_display,
+    }
+    chunk["_subsection_debug_cache"] = debug_maps
+    return debug_maps
 
 
 def plot_subsection_debug(
     pipeline_result: dict[str, Any],
     subsection_index: int,
-    figsize: tuple[int, int] = (24, 5),
+    figsize: tuple[int, int] = (34, 5),
 ):
     chunk = next(
         (candidate for candidate in pipeline_result["chunk_results"] if int(candidate["chunk_index"]) == int(subsection_index)),
@@ -2297,13 +2660,18 @@ def plot_subsection_debug(
     dino_score = np.asarray(chunk.get("dino_score_px", chunk["score_px"]), dtype=np.float32)
     support = np.asarray(chunk["support_px"], dtype=bool)
     power = np.asarray(chunk.get("power_px", np.zeros_like(corrected_chunk)), dtype=np.float32)
+    on_demand_debug = _compute_subsection_debug_maps(pipeline_result, chunk, corrected_chunk)
+    coherence = np.asarray(on_demand_debug["coherence_px"], dtype=np.float32)
+    texture_score = np.asarray(on_demand_debug["texture_score_px"], dtype=np.float32)
     final_mask = np.asarray(chunk["mask_px"], dtype=bool)
-    fig, axes = plt.subplots(1, 5, figsize=figsize, constrained_layout=True)
+    fig, axes = plt.subplots(1, 7, figsize=figsize, constrained_layout=True)
     _show_debug_panel(axes[0], corrected_chunk, f"Subsection {subsection_index} input", display_transposed, "viridis", vmin, vmax)
     _show_debug_panel(axes[1], raw_dino_mask.astype(np.float32), f"Subsection {subsection_index} raw DINO mask", display_transposed, "gray", 0.0, 1.0)
     _show_debug_panel(axes[2], dino_score, f"Subsection {subsection_index} DINO score + support", display_transposed, "magma", 0.0, 1.0)
     support_display = support.T if display_transposed else support
     axes[2].imshow(np.where(support_display, 1.0, np.nan), aspect="auto", origin="lower", cmap="winter", alpha=0.18, interpolation="nearest")
     _show_debug_panel(axes[3], power, f"Subsection {subsection_index} normalized power", display_transposed, "cividis", 0.0, 1.0)
-    _show_debug_overlay(axes[4], corrected_chunk, final_mask, f"Subsection {subsection_index} final overlay", display_transposed, vmin, vmax)
+    _show_debug_panel(axes[4], coherence, f"Subsection {subsection_index} coherence", display_transposed, "plasma", 0.0, 1.0)
+    _show_debug_panel(axes[5], texture_score, f"Subsection {subsection_index} texture score from coherence", display_transposed, "magma", 0.0, 1.0)
+    _show_debug_overlay(axes[6], corrected_chunk, final_mask, f"Subsection {subsection_index} final overlay", display_transposed, vmin, vmax)
     return fig, axes
