@@ -850,6 +850,109 @@ def _fill_nearly_continuous_time_gaps(
     return filled
 
 
+def _true_runs(mask_1d: np.ndarray) -> list[tuple[int, int]]:
+    mask_1d = np.asarray(mask_1d, dtype=bool).reshape(-1)
+    if mask_1d.size == 0:
+        return []
+
+    padded = np.pad(mask_1d.astype(np.int8), (1, 1), mode="constant")
+    transitions = np.diff(padded)
+    run_starts = np.flatnonzero(transitions == 1)
+    run_stops = np.flatnonzero(transitions == -1)
+    return [(int(start), int(stop)) for start, stop in zip(run_starts, run_stops)]
+
+
+def _split_component_candidate_masks(
+    component_mask_local: np.ndarray,
+    min_freq_span_px: int,
+    min_time_span_px: int,
+) -> list[dict[str, Any]]:
+    component_mask_local = np.asarray(component_mask_local, dtype=bool)
+    if component_mask_local.ndim != 2 or not np.any(component_mask_local):
+        return [{"mask": component_mask_local.astype(bool), "split_role": "unsplit", "split_applied": False}]
+
+    active_cols = np.flatnonzero(np.any(component_mask_local, axis=0))
+    if active_cols.size < max(6, 2 * int(min_time_span_px)):
+        return [{"mask": component_mask_local.astype(bool), "split_role": "unsplit", "split_applied": False}]
+
+    col_span = np.zeros(component_mask_local.shape[1], dtype=np.int32)
+    for col in active_cols:
+        rows = np.flatnonzero(component_mask_local[:, col])
+        if rows.size:
+            col_span[col] = int(rows.max() - rows.min() + 1)
+
+    active_spans = col_span[active_cols]
+    if active_spans.size < max(6, 2 * int(min_time_span_px)):
+        return [{"mask": component_mask_local.astype(bool), "split_role": "unsplit", "split_applied": False}]
+
+    global_rows = np.flatnonzero(np.any(component_mask_local, axis=1))
+    if global_rows.size == 0:
+        return [{"mask": component_mask_local.astype(bool), "split_role": "unsplit", "split_applied": False}]
+
+    baseline_span = float(np.quantile(active_spans.astype(np.float32), 0.35))
+    global_span = int(global_rows.max() - global_rows.min() + 1)
+    burst_span_threshold = max(
+        int(np.ceil(baseline_span * 1.8)),
+        int(np.ceil(baseline_span + max(4.0, float(min_freq_span_px) * 0.5))),
+        int(min_freq_span_px),
+    )
+    if burst_span_threshold >= global_span:
+        return [{"mask": component_mask_local.astype(bool), "split_role": "unsplit", "split_applied": False}]
+
+    burst_cols_mask = np.zeros(component_mask_local.shape[1], dtype=bool)
+    burst_cols_mask[active_cols] = active_spans >= burst_span_threshold
+    burst_runs = [
+        (start, stop)
+        for start, stop in _true_runs(burst_cols_mask)
+        if (stop - start) >= int(min_time_span_px)
+        and (stop - start) < max(int(active_cols.size * 0.7), int(min_time_span_px) + 1)
+    ]
+    if not burst_runs:
+        return [{"mask": component_mask_local.astype(bool), "split_role": "unsplit", "split_applied": False}]
+
+    non_burst_cols_mask = np.zeros(component_mask_local.shape[1], dtype=bool)
+    non_burst_cols_mask[active_cols] = True
+    non_burst_cols_mask[burst_cols_mask] = False
+    non_burst_cols = np.flatnonzero(non_burst_cols_mask)
+    if non_burst_cols.size < max(4, 2 * int(min_time_span_px)):
+        return [{"mask": component_mask_local.astype(bool), "split_role": "unsplit", "split_applied": False}]
+
+    row_hits = np.count_nonzero(component_mask_local[:, non_burst_cols], axis=1)
+    min_row_hits = max(2, int(np.ceil(non_burst_cols.size * 0.45)))
+    carrier_row_runs = _true_runs(row_hits >= min_row_hits)
+    if not carrier_row_runs:
+        return [{"mask": component_mask_local.astype(bool), "split_role": "unsplit", "split_applied": False}]
+
+    carrier_freq_start, carrier_freq_stop = max(carrier_row_runs, key=lambda run: run[1] - run[0])
+    carrier_freq_span = int(carrier_freq_stop - carrier_freq_start)
+    if carrier_freq_span < max(2, int(np.floor(baseline_span))) or carrier_freq_span >= burst_span_threshold:
+        return [{"mask": component_mask_local.astype(bool), "split_role": "unsplit", "split_applied": False}]
+
+    carrier_mask = np.zeros_like(component_mask_local, dtype=bool)
+    carrier_mask[carrier_freq_start:carrier_freq_stop, :] = component_mask_local[carrier_freq_start:carrier_freq_stop, :]
+    if np.count_nonzero(carrier_mask) < max(2, int(min_time_span_px) * 2):
+        return [{"mask": component_mask_local.astype(bool), "split_role": "unsplit", "split_applied": False}]
+
+    candidate_masks: list[dict[str, Any]] = [
+        {"mask": carrier_mask.astype(bool), "split_role": "persistent_carrier", "split_applied": True}
+    ]
+    for start, stop in burst_runs:
+        burst_mask = np.zeros_like(component_mask_local, dtype=bool)
+        burst_mask[:, start:stop] = component_mask_local[:, start:stop]
+        if np.count_nonzero(burst_mask) == 0:
+            continue
+        candidate_masks.append({
+            "mask": burst_mask.astype(bool),
+            "split_role": "transient_wideband_burst",
+            "split_applied": True,
+        })
+
+    if len(candidate_masks) < 2:
+        return [{"mask": component_mask_local.astype(bool), "split_role": "unsplit", "split_applied": False}]
+
+    return candidate_masks
+
+
 def group_signal_mask_regions(
     mask: np.ndarray,
     score_map: np.ndarray | None = None,
@@ -886,9 +989,11 @@ def group_signal_mask_regions(
     )
 
     component_labels, n_components = ndimage.label(bridged_mask)
+    candidate_component_labels = np.zeros_like(component_labels, dtype=np.int32)
     grouped_mask = np.zeros_like(working_mask, dtype=bool)
     boxes: list[dict[str, int | float]] = []
     component_rows: list[dict[str, int | float]] = []
+    output_component_id = 0
 
     score_map_arr = None if score_map is None else np.asarray(score_map, dtype=np.float32)
     active_scores = None
@@ -902,63 +1007,130 @@ def group_signal_mask_regions(
             continue
 
         row_coords, col_coords = np.nonzero(component_mask)
-        freq_start = int(row_coords.min())
-        freq_stop = int(row_coords.max()) + 1
-        time_start = int(col_coords.min())
-        time_stop = int(col_coords.max()) + 1
-        freq_span = int(freq_stop - freq_start)
-        time_span = int(time_stop - time_start)
-        bbox_area = max(freq_span * time_span, 1)
-        filled_area = int(np.count_nonzero(component_mask))
-        density = float(filled_area / bbox_area)
+        parent_freq_start = int(row_coords.min())
+        parent_freq_stop = int(row_coords.max()) + 1
+        parent_time_start = int(col_coords.min())
+        parent_time_stop = int(col_coords.max()) + 1
+        component_mask_local = component_mask[parent_freq_start:parent_freq_stop, parent_time_start:parent_time_stop]
 
-        component_mask_local = component_mask[freq_start:freq_stop, time_start:time_stop]
-
-        if score_map_arr is not None:
-            component_scores = score_map_arr[freq_start:freq_stop, time_start:time_stop][component_mask_local]
-            score_peak = float(np.max(component_scores)) if component_scores.size else 0.0
-            score_mean = float(np.mean(component_scores)) if component_scores.size else 0.0
-        else:
-            score_peak = 0.0
-            score_mean = 0.0
-        keep_component = (
-            filled_area >= int(min_component_size)
-            and freq_span >= int(min_freq_span_px)
-            and time_span >= int(min_time_span_px)
-            and density >= float(min_density)
-            and score_peak >= peak_score_floor
+        candidate_masks = _split_component_candidate_masks(
+            component_mask_local,
+            min_freq_span_px=int(min_freq_span_px),
+            min_time_span_px=int(min_time_span_px),
         )
-        component_rows.append({
-            "component_id": int(component_id),
-            "freq_start": freq_start,
-            "freq_stop": freq_stop,
-            "time_start": time_start,
-            "time_stop": time_stop,
-            "freq_span": freq_span,
-            "time_span": time_span,
-            "filled_area": filled_area,
-            "density": density,
-            "score_mean": score_mean,
-            "score_peak": score_peak,
-            "kept": bool(keep_component),
-        })
 
-        if not keep_component:
-            continue
+        for candidate in candidate_masks:
+            candidate_mask_local = np.asarray(candidate["mask"], dtype=bool)
+            if not np.any(candidate_mask_local):
+                continue
 
-        grouped_mask[freq_start:freq_stop, time_start:time_stop] |= component_mask_local
-        boxes.append({
-            "freq_start": freq_start,
-            "freq_stop": freq_stop,
-            "time_start": time_start,
-            "time_stop": time_stop,
-            "freq_span": freq_span,
-            "time_span": time_span,
-            "filled_area": filled_area,
-            "density": density,
-            "score_mean": score_mean,
-            "score_peak": score_peak,
-        })
+            local_row_coords, local_col_coords = np.nonzero(candidate_mask_local)
+            local_freq_start = int(local_row_coords.min())
+            local_freq_stop = int(local_row_coords.max()) + 1
+            local_time_start = int(local_col_coords.min())
+            local_time_stop = int(local_col_coords.max()) + 1
+
+            freq_start = int(parent_freq_start + local_freq_start)
+            freq_stop = int(parent_freq_start + local_freq_stop)
+            time_start = int(parent_time_start + local_time_start)
+            time_stop = int(parent_time_start + local_time_stop)
+            freq_span = int(freq_stop - freq_start)
+            time_span = int(time_stop - time_start)
+            bbox_area = max(freq_span * time_span, 1)
+            filled_area = int(np.count_nonzero(candidate_mask_local))
+            density = float(filled_area / bbox_area)
+
+            cropped_candidate_mask = candidate_mask_local[local_freq_start:local_freq_stop, local_time_start:local_time_stop]
+
+            if score_map_arr is not None:
+                component_scores = score_map_arr[freq_start:freq_stop, time_start:time_stop][cropped_candidate_mask]
+                score_peak = float(np.max(component_scores)) if component_scores.size else 0.0
+                score_mean = float(np.mean(component_scores)) if component_scores.size else 0.0
+            else:
+                score_peak = 0.0
+                score_mean = 0.0
+            meets_min_component_size = bool(filled_area >= int(min_component_size))
+            meets_min_freq_span = bool(freq_span >= int(min_freq_span_px))
+            meets_min_time_span = bool(time_span >= int(min_time_span_px))
+            meets_min_density = bool(density >= float(min_density))
+            meets_peak_score_floor = bool(score_peak >= peak_score_floor)
+            keep_component = (
+                meets_min_component_size
+                and meets_min_freq_span
+                and meets_min_time_span
+                and meets_min_density
+                and meets_peak_score_floor
+            )
+            failed_reasons = []
+            if not meets_min_component_size:
+                failed_reasons.append("min_component_size")
+            if not meets_min_freq_span:
+                failed_reasons.append("min_freq_span_px")
+            if not meets_min_time_span:
+                failed_reasons.append("min_time_span_px")
+            if not meets_min_density:
+                failed_reasons.append("min_density")
+            if not meets_peak_score_floor:
+                failed_reasons.append("peak_score_floor")
+
+            output_component_id += 1
+            candidate_label_view = candidate_component_labels[freq_start:freq_stop, time_start:time_stop]
+            candidate_label_view[np.logical_and(cropped_candidate_mask, candidate_label_view == 0)] = int(output_component_id)
+
+            component_rows.append({
+                "component_id": int(output_component_id),
+                "parent_component_id": int(component_id),
+                "split_role": str(candidate.get("split_role", "unsplit")),
+                "split_applied": bool(candidate.get("split_applied", False)),
+                "freq_start": freq_start,
+                "freq_stop": freq_stop,
+                "time_start": time_start,
+                "time_stop": time_stop,
+                "size_px": filled_area,
+                "freq_span": freq_span,
+                "freq_span_px": freq_span,
+                "time_span": time_span,
+                "time_span_px": time_span,
+                "filled_area": filled_area,
+                "density": density,
+                "score_mean": score_mean,
+                "score_peak": score_peak,
+                "score_peak_minus_floor": float(score_peak - peak_score_floor),
+                "min_component_size_threshold": int(min_component_size),
+                "min_freq_span_threshold_px": int(min_freq_span_px),
+                "min_time_span_threshold_px": int(min_time_span_px),
+                "min_density_threshold": float(min_density),
+                "peak_score_floor_value": peak_score_floor,
+                "min_component_size": meets_min_component_size,
+                "min_freq_span_px": meets_min_freq_span,
+                "min_time_span_px": meets_min_time_span,
+                "min_density": meets_min_density,
+                "peak_score_floor": meets_peak_score_floor,
+                "failed_reasons": failed_reasons,
+                "primary_failed_reason": failed_reasons[0] if failed_reasons else None,
+                "accepted": bool(keep_component),
+                "kept": bool(keep_component),
+            })
+
+            if not keep_component:
+                continue
+
+            grouped_mask[freq_start:freq_stop, time_start:time_stop] |= cropped_candidate_mask
+            boxes.append({
+                "freq_start": freq_start,
+                "freq_stop": freq_stop,
+                "time_start": time_start,
+                "time_stop": time_stop,
+                "freq_span": freq_span,
+                "time_span": time_span,
+                "filled_area": filled_area,
+                "density": density,
+                "score_mean": score_mean,
+                "score_peak": score_peak,
+                "split_role": str(candidate.get("split_role", "unsplit")),
+                "split_applied": bool(candidate.get("split_applied", False)),
+                "parent_component_id": int(component_id),
+            })
 
     if valid_row_mask is not None:
         grouped_mask[~valid_row_mask, :] = False
@@ -966,6 +1138,7 @@ def group_signal_mask_regions(
     return {
         "seed_mask": working_mask.astype(bool),
         "bridged_mask": bridged_mask.astype(bool),
+        "component_labels": candidate_component_labels.astype(np.int32),
         "grouped_mask": grouped_mask.astype(bool),
         "boxes": boxes,
         "components": component_rows,
@@ -1513,7 +1686,10 @@ def _show_debug_overlay(
     overlay_cmap: str = "autumn",
     overlay_alpha: float = 0.5,
     boxes: list[dict[str, int | float]] | None = None,
+    mask_cmap: str | None = None,
 ):
+    if mask_cmap is not None:
+        overlay_cmap = mask_cmap
     display_base = base.T if display_transposed else base
     display_overlay = overlay.T if display_transposed else overlay
     ax.imshow(display_base, aspect="auto", origin="lower", cmap="gray", vmin=base_vmin, vmax=base_vmax, interpolation="nearest")
