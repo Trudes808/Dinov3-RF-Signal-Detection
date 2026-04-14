@@ -953,6 +953,21 @@ def _split_component_candidate_masks(
     return candidate_masks
 
 
+def _component_envelope_area(component_mask: np.ndarray) -> int:
+    component_mask = np.asarray(component_mask, dtype=bool)
+    if component_mask.ndim != 2 or not np.any(component_mask):
+        return 0
+
+    envelope_area = 0
+    active_cols = np.flatnonzero(np.any(component_mask, axis=0))
+    for col in active_cols:
+        rows = np.flatnonzero(component_mask[:, col])
+        if rows.size == 0:
+            continue
+        envelope_area += int(rows.max() - rows.min() + 1)
+    return int(envelope_area)
+
+
 def group_signal_mask_regions(
     mask: np.ndarray,
     score_map: np.ndarray | None = None,
@@ -1036,11 +1051,13 @@ def group_signal_mask_regions(
             time_stop = int(parent_time_start + local_time_stop)
             freq_span = int(freq_stop - freq_start)
             time_span = int(time_stop - time_start)
-            bbox_area = max(freq_span * time_span, 1)
-            filled_area = int(np.count_nonzero(candidate_mask_local))
-            density = float(filled_area / bbox_area)
-
             cropped_candidate_mask = candidate_mask_local[local_freq_start:local_freq_stop, local_time_start:local_time_stop]
+            bbox_area = max(freq_span * time_span, 1)
+            envelope_area = max(_component_envelope_area(cropped_candidate_mask), 1)
+            filled_area = int(np.count_nonzero(cropped_candidate_mask))
+            bbox_density = float(filled_area / bbox_area)
+            envelope_density = float(filled_area / envelope_area)
+            density = envelope_density
 
             if score_map_arr is not None:
                 component_scores = score_map_arr[freq_start:freq_stop, time_start:time_stop][cropped_candidate_mask]
@@ -1093,6 +1110,10 @@ def group_signal_mask_regions(
                 "time_span_px": time_span,
                 "filled_area": filled_area,
                 "density": density,
+                "bbox_area": bbox_area,
+                "bbox_density": bbox_density,
+                "envelope_area": envelope_area,
+                "envelope_density": envelope_density,
                 "score_mean": score_mean,
                 "score_peak": score_peak,
                 "score_peak_minus_floor": float(score_peak - peak_score_floor),
@@ -1125,6 +1146,8 @@ def group_signal_mask_regions(
                 "time_span": time_span,
                 "filled_area": filled_area,
                 "density": density,
+                "bbox_density": bbox_density,
+                "envelope_density": envelope_density,
                 "score_mean": score_mean,
                 "score_peak": score_peak,
                 "split_role": str(candidate.get("split_role", "unsplit")),
