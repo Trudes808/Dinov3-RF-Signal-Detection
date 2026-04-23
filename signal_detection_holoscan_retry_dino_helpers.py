@@ -557,6 +557,172 @@ def build_frequency_chunks(
     return chunks
 
 
+def chunk_plan_has_uniform_rows(chunk_plan: list[dict[str, Any]]) -> bool:
+    if not chunk_plan:
+        return False
+    reference_rows = int(chunk_plan[0]["row_stop"]) - int(chunk_plan[0]["row_start"])
+    if reference_rows <= 0:
+        return False
+    return all((int(chunk["row_stop"]) - int(chunk["row_start"])) == reference_rows for chunk in chunk_plan)
+
+
+def _calibrated_uniform_chunk_geometry(
+    freq_axis_hz: np.ndarray,
+    chunk_bandwidth_hz: float,
+    chunk_overlap_hz: float,
+    min_rows: int,
+) -> dict[str, int] | None:
+    freq_axis_hz = np.asarray(freq_axis_hz, dtype=np.float32).reshape(-1)
+    if freq_axis_hz.size < 2:
+        return None
+    bin_hz = float(np.median(np.abs(np.diff(freq_axis_hz))))
+    step_hz = float(chunk_bandwidth_hz - chunk_overlap_hz)
+    if not np.isfinite(bin_hz) or bin_hz <= 0.0 or not np.isfinite(step_hz) or step_hz <= 0.0:
+        return None
+    chunk_rows = max(int(min_rows), int(round(float(chunk_bandwidth_hz) / bin_hz)))
+    overlap_rows = int(np.clip(round(float(chunk_overlap_hz) / bin_hz), 0, chunk_rows - 1))
+    step_rows = max(1, chunk_rows - overlap_rows)
+    if chunk_rows < int(min_rows):
+        return None
+    return {
+        "chunk_rows": int(chunk_rows),
+        "overlap_rows": int(overlap_rows),
+        "step_rows": int(step_rows),
+    }
+
+
+def _build_uniform_row_chunks(
+    freq_axis_hz: np.ndarray,
+    valid_row_mask: np.ndarray,
+    *,
+    chunk_rows: int,
+    step_rows: int,
+    min_rows: int,
+) -> list[dict[str, Any]]:
+    freq_axis_hz = np.asarray(freq_axis_hz, dtype=np.float32).reshape(-1)
+    valid_row_mask = np.asarray(valid_row_mask, dtype=bool).reshape(-1)
+    if freq_axis_hz.size == 0 or valid_row_mask.shape[0] != freq_axis_hz.shape[0] or chunk_rows < int(min_rows) or step_rows <= 0:
+        return []
+    valid_idx = np.flatnonzero(valid_row_mask)
+    valid_count = int(valid_idx.size)
+    if valid_count < int(chunk_rows):
+        return []
+    chunks: list[dict[str, Any]] = []
+    chunk_index = 0
+    for start_pos in range(0, valid_count - int(chunk_rows) + 1, int(step_rows)):
+        start_idx = int(valid_idx[start_pos])
+        stop_idx = int(valid_idx[start_pos + int(chunk_rows) - 1]) + 1
+        chunks.append({
+            "chunk_index": chunk_index,
+            "row_start": start_idx,
+            "row_stop": stop_idx,
+            "freq_start_hz": float(freq_axis_hz[start_idx]),
+            "freq_stop_hz": float(freq_axis_hz[stop_idx - 1]),
+        })
+        chunk_index += 1
+    return chunks
+
+
+def build_frequency_chunks_with_minimal_uniform_sideband_trim(
+    freq_axis_hz: np.ndarray,
+    chunk_bandwidth_hz: float,
+    chunk_overlap_hz: float,
+    *,
+    ignore_sideband_percent: float = 0.0,
+    min_keep_rows: int = 16,
+    ignore_sideband_hz: float | None = None,
+    min_rows: int = 16,
+    uncalibrated_chunk_fraction: float = 0.40,
+    uncalibrated_overlap_fraction: float = 0.20,
+) -> dict[str, Any]:
+    freq_axis_hz = np.asarray(freq_axis_hz, dtype=np.float32).reshape(-1)
+    ignore_info = compute_ignore_sideband_rows(
+        freq_axis_hz,
+        ignore_sideband_percent=ignore_sideband_percent,
+        min_keep_rows=min_keep_rows,
+        ignore_sideband_hz=ignore_sideband_hz,
+    )
+
+    calibrated_geometry = _calibrated_uniform_chunk_geometry(
+        freq_axis_hz,
+        chunk_bandwidth_hz,
+        chunk_overlap_hz,
+        min_rows,
+    )
+    if calibrated_geometry is not None:
+        max_bins = max(0, (int(freq_axis_hz.size) - int(max(1, min_keep_rows))) // 2)
+        start_bins = int(ignore_info["applied_bins"])
+        for applied_bins in range(start_bins, max_bins + 1):
+            valid_count = int(freq_axis_hz.size) - 2 * int(applied_bins)
+            if valid_count < int(calibrated_geometry["chunk_rows"]):
+                break
+            if (valid_count - int(calibrated_geometry["chunk_rows"])) % int(calibrated_geometry["step_rows"]) != 0:
+                continue
+            candidate_info = dict(ignore_info)
+            candidate_info["applied_bins"] = int(applied_bins)
+            bin_hz = float(candidate_info.get("bin_hz", 0.0) or 0.0)
+            candidate_info["applied_hz"] = float(applied_bins * bin_hz)
+            candidate_info["applied_percent"] = float(applied_bins / max(int(freq_axis_hz.size), 1))
+            valid_row_mask = np.ones(freq_axis_hz.shape[0], dtype=bool)
+            if applied_bins > 0:
+                valid_row_mask[:applied_bins] = False
+                valid_row_mask[-applied_bins:] = False
+            candidate_info["valid_row_mask"] = valid_row_mask
+            candidate_plan = _build_uniform_row_chunks(
+                freq_axis_hz,
+                valid_row_mask,
+                chunk_rows=int(calibrated_geometry["chunk_rows"]),
+                step_rows=int(calibrated_geometry["step_rows"]),
+                min_rows=min_rows,
+            )
+            if candidate_plan and chunk_plan_has_uniform_rows(candidate_plan):
+                return {"ignore_info": candidate_info, "chunk_plan": candidate_plan}
+
+    def build_candidate(applied_bins: int) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        candidate_info = dict(ignore_info)
+        candidate_info["applied_bins"] = int(applied_bins)
+        bin_hz = float(candidate_info.get("bin_hz", 0.0) or 0.0)
+        candidate_info["applied_hz"] = float(applied_bins * bin_hz)
+        candidate_info["applied_percent"] = float(applied_bins / max(int(freq_axis_hz.size), 1))
+        valid_row_mask = np.ones(freq_axis_hz.shape[0], dtype=bool)
+        if applied_bins > 0:
+            valid_row_mask[:applied_bins] = False
+            valid_row_mask[-applied_bins:] = False
+        candidate_info["valid_row_mask"] = valid_row_mask
+        candidate_plan = build_frequency_chunks(
+            freq_axis_hz,
+            chunk_bandwidth_hz,
+            chunk_overlap_hz,
+            min_rows=min_rows,
+            valid_row_mask=valid_row_mask,
+            uncalibrated_chunk_fraction=uncalibrated_chunk_fraction,
+            uncalibrated_overlap_fraction=uncalibrated_overlap_fraction,
+        )
+        return candidate_info, candidate_plan
+
+    selected_info, selected_plan = build_candidate(int(ignore_info["applied_bins"]))
+    if chunk_plan_has_uniform_rows(selected_plan):
+        return {"ignore_info": selected_info, "chunk_plan": selected_plan}
+
+    max_bins = max(0, (int(freq_axis_hz.size) - int(max(1, min_keep_rows))) // 2)
+    target_chunk_count = len(selected_plan)
+    start_bins = int(ignore_info["applied_bins"]) + 1
+
+    for applied_bins in range(start_bins, max_bins + 1):
+        candidate_info, candidate_plan = build_candidate(applied_bins)
+        if len(candidate_plan) != target_chunk_count:
+            continue
+        if chunk_plan_has_uniform_rows(candidate_plan):
+            return {"ignore_info": candidate_info, "chunk_plan": candidate_plan}
+
+    for applied_bins in range(start_bins, max_bins + 1):
+        candidate_info, candidate_plan = build_candidate(applied_bins)
+        if chunk_plan_has_uniform_rows(candidate_plan):
+            return {"ignore_info": candidate_info, "chunk_plan": candidate_plan}
+
+    return {"ignore_info": selected_info, "chunk_plan": selected_plan}
+
+
 def _normalize_map01_local(x: np.ndarray, low_q: float = 5.0, high_q: float = 95.0) -> np.ndarray:
     x = np.asarray(x, dtype=np.float32)
     vals = x[np.isfinite(x)]
